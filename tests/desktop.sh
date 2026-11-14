@@ -9,6 +9,8 @@
 # it by its PID. Checks what it can by itself (privileged globals hidden, grim
 # refused, the session's processes and sockets unchanged); the window you
 # answer: vkcube should spin on your sway for 15 s, on the RTX 2080, and close.
+# NOTE (R4): while its window has focus, a --show job gets your keystrokes
+# and the current clipboard. Don't type or copy anything secret meanwhile.
 
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -45,18 +47,20 @@ rm -rf "$T"
 mkdir -p "$T"
 WOK_JAIL_PATH=$jail_path "$wok" daemon --socket "$T/s" --state "$T/state" 2>"$T/daemon.log" &
 dpid=$!
+# stop our daemon (by its PID) however the script ends, Ctrl-C included
+trap 'kill "$dpid" 2>/dev/null' EXIT
 for _ in $(seq 50); do [ -S "$T/s" ] && break; sleep 0.1; done
 W() { (cd "$T" && WOK_SOCKET=$T/s "$wok" "$@"); }
 
 outside=$("$winfo" 2>&1)
 inside=$(W run --show -- wayland-info 2>&1)
 check "a --show job reaches the session" grep -q "interface: 'xdg_wm_base'" <<<"$inside"
-for g in zwlr_screencopy_manager_v1 ext_image_copy_capture_manager_v1 zwlr_data_control_manager_v1 \
-         ext_data_control_manager_v1 zwp_virtual_keyboard_manager_v1 zwlr_virtual_pointer_manager_v1 \
-         zwlr_layer_shell_v1 zwlr_foreign_toplevel_manager_v1 ext_session_lock_manager_v1; do
-  grep -q "'$g'" <<<"$outside" || continue
-  check "hidden from the job: $g" bash -c "! grep -q \"'$g'\" <<<\"\$1\"" _ "$inside"
-done
+# every global the job is offered must be on the reviewed allowlist
+names() { grep -o "interface: '[A-Za-z0-9_]*'" | sed "s/interface: '\(.*\)'/\1/" | sort -u; }
+allowed=$(grep -v '^#' "$here/tests/globals-allowed.txt" | awk '{print $1}' | grep . | sort -u)
+extra=$(comm -23 <(names <<<"$inside") <(echo "$allowed") | tr '\n' ' ')
+check "every global offered to the job is on the allowlist (off it: [$extra])" [ -z "$extra" ]
+echo "      hidden from the job on your session: $(comm -23 <(names <<<"$outside") <(names <<<"$inside") | tr '\n' ' ')"
 W run --show -- sh -c 'grim $WOK_OUT/stolen.png' >/dev/null 2>&1
 check "grim can't capture the session from a job" [ -z "$(find "$T/wok-out" -name stolen.png 2>/dev/null)" ]
 

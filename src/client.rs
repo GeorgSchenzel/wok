@@ -112,7 +112,7 @@ fn status_inner(sock: &Path) -> Result<(), Failure> {
             show_queued,
         }) => {
             let job = |j: Option<proto::JobView>| match j {
-                Some(j) => format!("{} ({}s) {}", j.id, j.running_s, shell_words(&j.argv)),
+                Some(j) => format!("{} ({}s)", j.id, j.running_s),
                 None => "nothing".into(),
             };
             println!("running: {}", job(running));
@@ -202,7 +202,10 @@ fn run_inner(sock: &Path, opts: RunOpts) -> Result<i32, Failure> {
 
     receive_results(&mut r, opts.out, &id)?;
 
-    Ok(if exit.timed_out {
+    Ok(if let Some(why) = &exit.stopped {
+        eprintln!("wok: job {id} stopped: {why}");
+        EXIT_WOK
+    } else if exit.timed_out {
         eprintln!("wok: job {id} timed out after {}s", opts.req.timeout_s);
         EXIT_TIMEOUT
     } else if let Some(c) = exit.code {
@@ -250,20 +253,4 @@ fn receive_results(r: &mut impl io::Read, out: Option<PathBuf>, id: &str) -> Res
         eprintln!("wok: results in {}", dir.display());
     }
     Ok(())
-}
-
-fn shell_words(argv: &[String]) -> String {
-    argv.iter()
-        .map(|a| {
-            if !a.is_empty()
-                && a.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@".contains(c))
-            {
-                a.clone()
-            } else {
-                format!("'{}'", a.replace('\'', r"'\''"))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }

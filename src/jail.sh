@@ -7,8 +7,7 @@
 # uploaded files), out/ (what goes back) and home/ (a scratch HOME). In the
 # jail the home is /home/wok ($HOME), with job/ at /home/wok/job (the cwd)
 # and out/ at /home/wok/out ($WOK_OUT): fixed paths, so no host path reaches
-# a job. (They sit on the /home tmpfs because bwrap can't make mount points
-# under the read-only /.)
+# a job.
 #
 # The daemon runs it with a cleared environment plus:
 #   WOK_BWRAP        bwrap to use (else from PATH)
@@ -21,25 +20,41 @@
 #                    $WOK_OUT/screenshot.png after s seconds, then stop the job
 #   WOK_JAIL_PATH    dirs put first on the job's PATH (the package's sway, grim)
 #   WOK_JOBENV_<K>   the job's own env, as K
+#   WOK_SCOPE        systemd-run to put the job in a transient user scope
+#                    with WOK_MEMORY_MAX and WOK_TASKS_MAX (unset: no cgroup
+#                    limits; the daemon warns). XDG_RUNTIME_DIR and
+#                    DBUS_SESSION_BUS_ADDRESS are for systemd-run; the job
+#                    never sees them (--clearenv).
 #
-# Properties (from the spike's R5/G1 jail, its 56 checks; tests/jail.sh):
-#   - no network: own netns, nothing up
+# Properties (tests/jail.sh):
+#   - the filesystem is an allowlist, not the host's / with holes: an empty
+#     root with only /nix/store, /etc, /usr, /bin, /lib64, /sys (read-only),
+#     a fresh /dev and /proc, the GPU's driver links in /run, and private
+#     tmpfs for /tmp, /dev/shm, /run, /home. Mounts the host has inside /etc
+#     or /sys (persisted host keys, machine-id, efivars, debugfs…) are masked.
+#     Nothing else of the host exists in the jail: no home, no /persist, no
+#     /backups, no /var, no /nix/var (the nix daemon socket).
 #   - writable on disk: only the job's home with job/ and out/ (all in
-#     <job-root>, removed by the daemon after the job); /tmp, /dev/shm, /run,
-#     /var… are private tmpfs
-#   - invisible: every host home (~/.ssh, credentials, stews, boxes' dirs),
-#     /run/user/<uid> (agent sockets, dbus, the desktop's wayland socket),
-#     /tmp/.X11-unix, the nix daemon socket (/nix/var), host /var /srv /mnt /media
+#     <job-root>, removed by the daemon after the job; the daemon caps their
+#     size); tmpfs mounts have sizes
+#   - no network: own netns, nothing up (AF_VSOCK isn't netns-scoped; there
+#     is no seccomp filter yet)
+#   - own user, pid, ipc, uts and cgroup namespaces; no nested user
+#     namespaces (--disable-userns)
+#   - memory and tasks capped by the scope (WOK_SCOPE)
 #   - no host environment (clearenv): API keys in the daemon's env don't leak
 #   - no controlling tty (--new-session; stdin is /dev/null)
-#   - GPU: /dev/dri and the NVIDIA nodes, /run/opengl-driver
+#   - GPU: the DRM render nodes (not the card nodes), the NVIDIA nodes,
+#     /run/opengl-driver
 #   - display: never the desktop's. A headless sway per job
 #     (WLR_BACKENDS=headless, gles2, a generated config, XWayland disabled, so
 #     it can't race the session for :0). So: no X11 in jobs, and the headless
 #     seat has no input devices (mesa-demos' eglut tools crash on that).
 #     --show: the desktop's compositor, but only through the job's own
-#     sandboxed listener (never the session's socket, which stays invisible
-#     with the rest of /run/user/<uid>); still no X11.
+#     sandboxed listener (never the session's socket); still no X11.
+#   - stopping: a TERM to this script is passed to the jail's pid 1, which
+#     passes it to every process in the jail, so a job can flush its output;
+#     a KILL to this script takes the jail along (--die-with-parent).
 #
 # Exit codes of its own: 250 the compositor didn't start; 251 the job exited
 # before its screenshot; 252 bad arguments.
@@ -68,20 +83,25 @@ case ${WOK_DISPLAY:-0} in
 esac
 user=$(id -un)
 
-# Runs inside the jail as `bash -c <this> wok-job <argv...>`: the job's argv
-# stays argv, never re-quoted through a shell.
+# Runs inside the jail as its pid 1, `bash -c <this> wok-job <argv...>`: the
+# job's argv stays argv, never re-quoted through a shell. As pid 1 it gets
+# only the signals it handles: a TERM goes to every process in the jail.
 INNER='
 set -u
 shot=${WOK_SHOT:-}
 display=${WOK_DISPLAY:-0}
 unset WOK_SHOT WOK_DISPLAY
+trap "kill -TERM -1 2>/dev/null" TERM
+# wait for pid $1 even through the TERM trap; its status in rc
+await() { while :; do wait "$1"; rc=$?; kill -0 "$1" 2>/dev/null || return 0; done; }
 if [ "$display" = show ]; then
   chmod 700 "$XDG_RUNTIME_DIR" || exit 250
   export WAYLAND_DISPLAY=wayland-0
-  exec "$@"
 fi
 if [ "$display" != 1 ]; then
-  exec "$@"
+  "$@" &
+  await $!
+  exit $rc
 fi
 rt=$XDG_RUNTIME_DIR
 mkdir -p "$rt" && chmod 700 "$rt" || exit 250
@@ -105,14 +125,15 @@ if [ -z "$wd" ]; then
 fi
 export WAYLAND_DISPLAY=$wd
 if [ -z "$shot" ]; then
-  "$@"
-  rc=$?
+  "$@" &
+  await $!
 else
   # the app runs in the background: a foreground app is gone at capture
   # time and grim gives an all-black PNG with exit 0 (learnings.md)
   "$@" &
   app=$!
-  sleep "$shot"
+  sleep "$shot" &
+  wait $!
   if kill -0 "$app" 2>/dev/null; then
     grim "$WOK_OUT/screenshot.png"
     rc=$?
@@ -132,41 +153,76 @@ for name in ${!WOK_JOBENV_@}; do
   env_job+=(--setenv "${name#WOK_JOBENV_}" "${!name}")
 done
 
-sys_tmpfs=()
-for d in /var /srv /mnt /media; do
-  [ -d "$d" ] && sys_tmpfs+=(--tmpfs "$d")
+# The allowlist. Read-only trees from the host:
+ro=()
+for d in /nix/store /etc /usr /bin /lib64 /sys; do
+  [ -d "$d" ] && ro+=(--ro-bind "$d" "$d")
+done
+# … minus whatever the host mounts inside /etc and /sys (impermanence binds
+# persisted files there: host keys, machine-id, NetworkManager's secrets;
+# /sys has efivars, debugfs, tracefs, bpf…): an empty dir or file instead.
+mask=()
+while read -r _ _ _ _ mp _; do
+  mp=$(printf '%b' "$mp") # mountinfo escapes spaces as \040
+  case $mp in
+    /etc/*|/sys/*)
+      if [ -d "$mp" ]; then mask+=(--tmpfs "$mp")
+      elif [ -e "$mp" ]; then mask+=(--ro-bind /dev/null "$mp")
+      fi ;;
+  esac
+done < /proc/self/mountinfo
+# GPU: render nodes and NVIDIA's nodes only
+gpu=()
+for n in /dev/dri/renderD* /dev/nvidia0 /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm /dev/nvidia-uvm-tools; do
+  [ -c "$n" ] && gpu+=(--dev-bind "$n" "$n")
+done
+runs=()
+for l in /run/opengl-driver /run/opengl-driver-32 /run/current-system; do
+  [ -e "$l" ] && runs+=(--ro-bind "$l" "$l")
 done
 
-exec "$bwrap" \
-  --ro-bind / / \
-  --dev /dev \
-  --tmpfs /dev/shm \
-  --dev-bind-try /dev/dri /dev/dri \
-  --dev-bind-try /dev/nvidia0 /dev/nvidia0 \
-  --dev-bind-try /dev/nvidiactl /dev/nvidiactl \
-  --dev-bind-try /dev/nvidia-modeset /dev/nvidia-modeset \
-  --dev-bind-try /dev/nvidia-uvm /dev/nvidia-uvm \
-  --dev-bind-try /dev/nvidia-uvm-tools /dev/nvidia-uvm-tools \
-  --tmpfs /home \
-  --bind "$root/home" /home/wok \
-  --bind "$root/job" /home/wok/job \
-  --bind "$root/out" /home/wok/out \
-  --tmpfs /run \
-  --ro-bind-try /run/opengl-driver /run/opengl-driver \
-  --ro-bind-try /run/opengl-driver-32 /run/opengl-driver-32 \
-  --ro-bind-try /run/current-system /run/current-system \
-  "${show[@]}" \
-  --tmpfs /tmp \
-  --tmpfs /nix/var \
-  "${sys_tmpfs[@]}" \
-  --proc /proc \
+scope=()
+if [ -n "${WOK_SCOPE:-}" ]; then
+  scope=("$WOK_SCOPE" --user --scope --quiet --collect --expand-environment=no
+    -p "MemoryMax=${WOK_MEMORY_MAX:-8G}" -p MemorySwapMax=0
+    -p "TasksMax=${WOK_TASKS_MAX:-1024}" --)
+fi
+
+info=$root/.bwrap-info
+rm -f "$info"
+# bwrap in a process group of its own (job control): the daemon's TERM to our
+# group must reach the jail's pid 1 through us, not kill bwrap (whose
+# --die-with-parent would then KILL the jail at once)
+set -m
+"${scope[@]}" "$bwrap" \
+  --unshare-user \
+  --disable-userns \
   --unshare-net \
   --unshare-pid \
   --unshare-ipc \
   --unshare-uts \
+  --unshare-cgroup-try \
+  --as-pid-1 \
+  --info-fd 3 \
   --hostname wok \
   --new-session \
   --die-with-parent \
+  --tmpfs / \
+  "${ro[@]}" \
+  "${mask[@]}" \
+  --proc /proc \
+  --dev /dev \
+  --size $((1 << 30)) --tmpfs /dev/shm \
+  "${gpu[@]}" \
+  --size $((16 << 20)) --tmpfs /home \
+  --bind "$root/home" /home/wok \
+  --bind "$root/job" /home/wok/job \
+  --bind "$root/out" /home/wok/out \
+  --size $((64 << 20)) --tmpfs /run \
+  "${runs[@]}" \
+  "${show[@]}" \
+  --size $((2 << 30)) --tmpfs /tmp \
+  --remount-ro / \
   --chdir /home/wok/job \
   --clearenv \
   --setenv HOME /home/wok \
@@ -181,4 +237,26 @@ exec "$bwrap" \
   --setenv WOK_DISPLAY "${WOK_DISPLAY:-0}" \
   --setenv WOK_SHOT "${WOK_SCREENSHOT:-}" \
   "${env_job[@]}" \
-  -- "$BASH" -c "$INNER" wok-job "$@"
+  -- "$BASH" -c "$INNER" wok-job "$@" 3>"$info" &
+bw=$!
+set +m
+
+# A TERM: to the jail's pid 1 (its host pid, from bwrap's info).
+forward() {
+  local pid=
+  for _ in $(seq 20); do
+    pid=$(sed -n 's/.*"child-pid": *\([0-9]*\).*/\1/p' "$info" 2>/dev/null)
+    [ -n "$pid" ] && break
+    sleep 0.05
+  done
+  if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null; else kill -KILL "$bw" 2>/dev/null; fi
+}
+trap forward TERM
+set +e
+while :; do
+  wait "$bw"
+  rc=$?
+  kill -0 "$bw" 2>/dev/null || break
+done
+rm -f "$info"
+exit $rc

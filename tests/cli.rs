@@ -264,7 +264,7 @@ fn a_client_that_leaves_takes_its_job_with_it() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let o = d.run(&["status"], t.path());
-        if s(&o.stdout).contains("sleep 60") {
+        if !s(&o.stdout).starts_with("running: nothing") {
             break;
         }
         assert!(Instant::now() < deadline, "the job never showed as running");
@@ -388,65 +388,137 @@ fn an_upload_that_tries_to_escape_is_refused() {
     assert_eq!(d.job_dirs(), 0);
 }
 
-/// A compositor stand-in for `--show`: announces the security-context
-/// manager, answers syncs, and records each listener's instance id.
+/// recvmsg: bytes and any fds that came with them.
+fn recv_fds(fd: i32, buf: &mut [u8]) -> (usize, Vec<i32>) {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut _,
+        iov_len: buf.len(),
+    };
+    let mut cbuf = [0u8; 128];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf.as_mut_ptr() as *mut _;
+    msg.msg_controllen = cbuf.len() as _;
+    let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+    let mut fds = Vec::new();
+    if n > 0 {
+        unsafe {
+            let mut cm = libc::CMSG_FIRSTHDR(&msg);
+            while !cm.is_null() {
+                if (*cm).cmsg_type == libc::SCM_RIGHTS {
+                    let count = ((*cm).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / 4;
+                    let p = libc::CMSG_DATA(cm) as *const i32;
+                    fds.extend((0..count).map(|k| *p.add(k)));
+                }
+                cm = libc::CMSG_NXTHDR(&msg, cm);
+            }
+        }
+    }
+    (n.max(0) as usize, fds)
+}
+
+/// One client of the stand-in compositor: `globals` announced, syncs
+/// answered, instance ids recorded; a listener it is handed is served with
+/// `inside` (what a sandboxed client sees).
+fn serve(
+    mut c: std::os::unix::net::UnixStream,
+    globals: &'static [&'static str],
+    inside: &'static [&'static str],
+    ids: Arc<Mutex<Vec<String>>>,
+) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let (n, fds) = recv_fds(c.as_raw_fd(), &mut chunk);
+        if n == 0 {
+            return;
+        }
+        if let Some(&lfd) = fds.first() {
+            let l = unsafe { UnixListener::from_raw_fd(lfd) };
+            let ids = ids.clone();
+            std::thread::spawn(move || {
+                for c in l.incoming().flatten() {
+                    let ids = ids.clone();
+                    std::thread::spawn(move || serve(c, inside, &[], ids));
+                }
+            });
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        while buf.len() >= 8 {
+            let obj = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+            let w = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
+            let size = (w >> 16) as usize;
+            if buf.len() < size {
+                break;
+            }
+            let body = buf[8..size].to_vec();
+            buf.drain(..size);
+            let op = w & 0xffff;
+            let msg = |obj: u32, op: u32, body: &[u8]| {
+                let mut m = obj.to_ne_bytes().to_vec();
+                m.extend(((((8 + body.len()) as u32) << 16) | op).to_ne_bytes());
+                m.extend(body);
+                m
+            };
+            let out = match (obj, op) {
+                (1, 1) => {
+                    let mut out = Vec::new();
+                    for (i, g) in globals.iter().enumerate() {
+                        let mut b = (i as u32 + 1).to_ne_bytes().to_vec();
+                        b.extend(((g.len() + 1) as u32).to_ne_bytes());
+                        b.extend(g.as_bytes());
+                        b.push(0);
+                        while !b.len().is_multiple_of(4) {
+                            b.push(0);
+                        }
+                        b.extend(1u32.to_ne_bytes());
+                        out.extend(msg(2, 0, &b));
+                    }
+                    out
+                }
+                (1, 0) => msg(u32::from_ne_bytes(body[0..4].try_into().unwrap()), 0, &[0; 4]),
+                (5, 3) => {
+                    let len = u32::from_ne_bytes(body[0..4].try_into().unwrap()) as usize;
+                    ids.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&body[4..3 + len]).into());
+                    vec![]
+                }
+                _ => vec![],
+            };
+            if c.write_all(&out).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// A compositor stand-in for `--show` that hides what sway hides; records
+/// each listener's instance id.
 fn fake_compositor(path: &Path) -> Arc<Mutex<Vec<String>>> {
+    fake_compositor_offering(path, &["wl_compositor", "xdg_wm_base"])
+}
+
+fn fake_compositor_offering(path: &Path, inside: &'static [&'static str]) -> Arc<Mutex<Vec<String>>> {
     let l = UnixListener::bind(path).unwrap();
     let ids = Arc::new(Mutex::new(Vec::new()));
     let ids2 = ids.clone();
     std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { return };
+        for c in l.incoming().flatten() {
             let ids = ids2.clone();
             std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 4096];
-                loop {
-                    let n = match c.read(&mut chunk) {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => n,
-                    };
-                    buf.extend_from_slice(&chunk[..n]);
-                    while buf.len() >= 8 {
-                        let obj = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
-                        let w = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
-                        let size = (w >> 16) as usize;
-                        if buf.len() < size {
-                            break;
-                        }
-                        let body = buf[8..size].to_vec();
-                        buf.drain(..size);
-                        let op = w & 0xffff;
-                        let msg = |obj: u32, op: u32, body: &[u8]| {
-                            let mut m = obj.to_ne_bytes().to_vec();
-                            m.extend((((8 + body.len()) as u32) << 16 | op).to_ne_bytes());
-                            m.extend(body);
-                            m
-                        };
-                        let out = match (obj, op) {
-                            (1, 1) => {
-                                let name = b"wp_security_context_manager_v1\0\0";
-                                let mut b = 1u32.to_ne_bytes().to_vec();
-                                b.extend(31u32.to_ne_bytes());
-                                b.extend(name);
-                                b.extend(1u32.to_ne_bytes());
-                                msg(2, 0, &b)
-                            }
-                            (1, 0) => msg(u32::from_ne_bytes(body[0..4].try_into().unwrap()), 0, &[0; 4]),
-                            (5, 3) => {
-                                let len = u32::from_ne_bytes(body[0..4].try_into().unwrap()) as usize;
-                                ids.lock()
-                                    .unwrap()
-                                    .push(String::from_utf8_lossy(&body[4..3 + len]).into());
-                                vec![]
-                            }
-                            _ => vec![],
-                        };
-                        if c.write_all(&out).is_err() {
-                            return;
-                        }
-                    }
-                }
+                serve(
+                    c,
+                    &[
+                        "wl_compositor",
+                        "zwlr_screencopy_manager_v1",
+                        "wp_security_context_manager_v1",
+                    ],
+                    inside,
+                    ids,
+                )
             });
         }
     });
@@ -551,5 +623,132 @@ fn show_takes_no_screenshot_and_needs_the_display() {
             "clap refuses {args:?}: {}",
             s(&o.stderr)
         );
+    }
+}
+
+#[test]
+fn show_is_refused_when_the_compositor_doesnt_hide() {
+    let t = tempfile::tempdir().unwrap();
+    let desktop = t.path().join("wayland-7");
+    let _ids = fake_compositor_offering(&desktop, &["wl_compositor", "zwlr_screencopy_manager_v1"]);
+    let d = Daemon::start_with(Some(&desktop));
+    let o = d.run(&["run", "--show", "--", "echo", "ran"], t.path());
+    assert_eq!(o.status.code(), Some(125), "{}", s(&o.stderr));
+    assert!(s(&o.stderr).contains("privileged"), "{}", s(&o.stderr));
+    assert!(!s(&o.stdout).contains("ran"));
+}
+
+#[test]
+fn a_refusal_with_an_upload_still_says_why() {
+    // the daemon refuses before reading the upload; the reason must arrive
+    // (not a reset read as "no daemon")
+    let t = tempfile::tempdir().unwrap();
+    let input = t.path().join("in");
+    fs::create_dir(&input).unwrap();
+    fs::write(input.join("big"), vec![7u8; 8 << 20]).unwrap();
+    let d = Daemon::start();
+    for args in [
+        ["run", "--in", "in", "--show", "--", "true"].as_slice(),
+        &["run", "--in", "in", "--timeout", "0", "--", "true"],
+    ] {
+        let o = d.run(args, t.path());
+        assert_eq!(o.status.code(), Some(125), "{args:?}: {}", s(&o.stderr));
+        assert!(!s(&o.stderr).contains("no wok daemon"), "{}", s(&o.stderr));
+    }
+}
+
+#[test]
+fn status_shows_no_argv() {
+    let t = tempfile::tempdir().unwrap();
+    let d = Daemon::start();
+    let mut c = d
+        .wok(&[
+            "run",
+            "--no-display",
+            "--",
+            "sh",
+            "-c",
+            "sleep 3; : secret-token-123",
+        ])
+        .current_dir(t.path())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let o = s(&d.run(&["status"], t.path()).stdout);
+        assert!(!o.contains("secret-token"), "{o}");
+        if !o.starts_with("running: nothing") {
+            assert!(o.lines().next().unwrap().ends_with("s)"), "{o}");
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    c.kill().unwrap();
+    c.wait().unwrap();
+}
+
+#[test]
+fn a_client_that_stops_reading_loses_its_job() {
+    // a hand-made client: uploads, then never reads; the job floods stdout
+    use std::os::unix::net::UnixStream;
+    let t = tempfile::tempdir().unwrap();
+    let d = Daemon::start();
+    let mut c = UnixStream::connect(&d.sock).unwrap();
+    let frame = |c: &mut UnixStream, p: &[u8]| {
+        c.write_all(&((p.len() + 1) as u32).to_be_bytes()).unwrap();
+        c.write_all(b"J").unwrap();
+        c.write_all(p).unwrap();
+    };
+    frame(
+        &mut c,
+        br#"{"t":"run","v":2,"argv":["sh","-c","yes flood"],"timeout_s":600,"display":false}"#,
+    );
+    frame(&mut c, br#"{"t":"end"}"#);
+    // the lane must free up: well within the write timeout plus the kill grace
+    let start = Instant::now();
+    loop {
+        let o = s(&d.run(&["status"], t.path()).stdout);
+        if start.elapsed() > Duration::from_secs(3) && o.starts_with("running: nothing") {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(40),
+            "the stalled client still holds the lane: {o}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(start.elapsed() >= Duration::from_secs(8), "dropped too early");
+    drop(c);
+}
+
+#[test]
+fn a_job_that_locks_its_dirs_is_still_sent_and_cleaned_up() {
+    // chmod 000 on dirs it made: the results still come, the dir still goes
+    let t = tempfile::tempdir().unwrap();
+    let d = Daemon::start();
+    let o = d.run(
+        &[
+            "run",
+            "--no-display",
+            "--out",
+            "res",
+            "--",
+            "sh",
+            "-c",
+            "mkdir $WOK_OUT/locked ~/locked; echo hi > $WOK_OUT/locked/f; echo ok > $WOK_OUT/top; chmod 000 $WOK_OUT/locked ~/locked",
+        ],
+        t.path(),
+    );
+    assert!(o.status.success(), "{}", s(&o.stderr));
+    assert_eq!(fs::read_to_string(t.path().join("res/top")).unwrap(), "ok\n");
+    assert_eq!(fs::read_to_string(t.path().join("res/locked/f")).unwrap(), "hi\n");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while d.job_dirs() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the job dir stays with a chmod 000 dir in it"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }

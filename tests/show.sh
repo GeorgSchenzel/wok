@@ -27,11 +27,11 @@ check() { local what=$1; shift; if "$@"; then ok "$what"; else bad "$what"; fi; 
 echo "building the tools…"
 tools=$(cd "$here" && nix build --no-link --print-out-paths --inputs-from . \
   nixpkgs#sway-unwrapped nixpkgs#grim nixpkgs#coreutils nixpkgs#bash \
-  nixpkgs#wayland-utils nixpkgs#weston) || exit 2
+  nixpkgs#wayland-utils nixpkgs#weston nixpkgs#wl-clipboard) || exit 2
 jail_path=$(printf '%s/bin:' $tools)
 jail_path=${jail_path%:}
 bin() { printf '%s\n' $tools | while read -r p; do [ -x "$p/bin/$1" ] && { echo "$p/bin/$1"; break; }; done; }
-sway=$(bin sway) swaymsg=$(bin swaymsg) winfo=$(bin wayland-info)
+sway=$(bin sway) swaymsg=$(bin swaymsg) winfo=$(bin wayland-info) wlcopy=$(bin wl-copy)
 
 desktop() {
   for p in sway Xwayland pipewire wireplumber; do
@@ -67,6 +67,8 @@ outside=$(WAYLAND_DISPLAY=$wd XDG_RUNTIME_DIR=$rt "$winfo" 2>&1)
 WAYLAND_DISPLAY=$wd WOK_JAIL_PATH=$jail_path \
   "$wok" daemon --socket "$T/s" --state "$T/state" 2>"$T/daemon.log" &
 dpid=$!
+# stop our daemon and stand-in sway (by PID) however the script ends
+trap 'kill "$dpid" "$swpid" 2>/dev/null' EXIT
 for _ in $(seq 50); do [ -S "$T/s" ] && break; sleep 0.1; done
 W() { (cd "$T" && WOK_SOCKET=$T/s "$wok" "$@"); }
 
@@ -74,15 +76,18 @@ W() { (cd "$T" && WOK_SOCKET=$T/s "$wok" "$@"); }
 inside=$(W run --show -- wayland-info 2>&1)
 check "wayland-info runs in a --show job" grep -q 'interface: .wl_compositor' <<<"$inside"
 check "the job gets xdg_wm_base (it can make windows)" grep -q "interface: 'xdg_wm_base'" <<<"$inside"
-# privileged: only visible outside a security context (sway's filter_global)
-for g in zwlr_screencopy_manager_v1 ext_image_copy_capture_manager_v1 zwlr_export_dmabuf_manager_v1 \
-         zwlr_data_control_manager_v1 ext_data_control_manager_v1 zwp_virtual_keyboard_manager_v1 \
-         zwlr_virtual_pointer_manager_v1 zwlr_layer_shell_v1 zwlr_foreign_toplevel_manager_v1 \
-         ext_foreign_toplevel_list_v1 ext_session_lock_manager_v1 zwlr_gamma_control_manager_v1 \
-         zwlr_output_manager_v1 wp_security_context_manager_v1 zwp_input_method_manager_v2; do
-  grep -q "'$g'" <<<"$outside" || { echo "      ($g: not offered by this sway at all)"; continue; }
-  check "hidden from the job: $g" bash -c "! grep -q \"'$g'\" <<<\"\$1\"" _ "$inside"
-done
+# Every global the job is offered must be on an allowlist (tests/globals-allowed.txt,
+# each entry reviewed): a privileged global nobody listed, or one a sway update adds,
+# fails here instead of passing silently.
+names() { grep -o "interface: '[A-Za-z0-9_]*'" | sed "s/interface: '\(.*\)'/\1/" | sort -u; }
+names <<<"$inside" > "$T/inside-globals"
+names <<<"$outside" > "$T/outside-globals"
+allowed=$(grep -v '^#' "$here/tests/globals-allowed.txt" | awk '{print $1}' | grep . | sort -u)
+extra=$(comm -23 "$T/inside-globals" <(echo "$allowed") | tr '\n' ' ')
+check "every global offered to the job is on the allowlist (off it: [$extra])" [ -z "$extra" ]
+hidden=$(comm -23 "$T/outside-globals" "$T/inside-globals" | tr '\n' ' ')
+echo "      hidden by the security context: $hidden"
+check "the stand-in offers screencopy outside (so the check above means something)" grep -qx zwlr_screencopy_manager_v1 "$T/outside-globals"
 W run --show -- sh -c 'grim $WOK_OUT/stolen.png' >"$T/grim.log" 2>&1
 rc=$?
 check "grim fails in a --show job (rc $rc)" [ $rc -ne 0 ]
@@ -92,6 +97,21 @@ check "the job's display is wayland-0, no X11, no sway IPC ($(tr '\n' ' ' <<<"$e
   [ "$env_out" = $'[wayland-0] [] []\nwayland-0' ]
 check "the session's own socket is invisible" bash -c "! (cd '$T' && WOK_SOCKET='$T/s' '$wok' run --show -- test -e '$wd')"
 check "the session's IPC socket is invisible" bash -c "! (cd '$T' && WOK_SOCKET='$T/s' '$wok' run --show -- test -e '$ipc')"
+
+# ---- known, not fixed (R4 finding 2): the clipboard reaches a focused job ----
+# Reported, not a PASS/FAIL: wok can't stop it (work-wok.md, Review).
+secret=wok-clip-$$-$RANDOM
+WAYLAND_DISPLAY=$wd XDG_RUNTIME_DIR=$rt "$wlcopy" "$secret" 2>/dev/null &
+cpid=$!
+sleep 0.5
+got=$(W run --show --timeout 10 -- wl-paste --no-newline 2>/dev/null)
+kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
+if [ "$got" = "$secret" ]; then
+  echo "KNOWN  a --show job read the session's clipboard (R4 finding 2, not fixable in wok)"
+else
+  echo "KNOWN  inconclusive here: the stand-in seat has no keyboard, so no window gets focus and no"
+  echo "       selection is offered (Wayland sends it to the focused client). On a real seat it is."
+fi
 
 # ---- a window on the session ------------------------------------------------
 (cd "$T" && WOK_SOCKET=$T/s exec "$wok" run --show --timeout 6 -- weston-flower) >"$T/win.log" 2>&1 &
@@ -105,7 +125,7 @@ done
 check "the job's window is on the session, sandbox engine wok" grep -q '"sandbox_engine": "wok"' <<<"$tree"
 check "  … app id wok" grep -q '"sandbox_app_id": "wok"' <<<"$tree"
 sid=$(grep -o '"sandbox_instance_id": "[^"]*"' <<<"$tree" | head -1)
-check "  … instance id the job's id ($sid)" grep -qE '"sandbox_instance_id": "[0-9]+-[0-9a-f]{4}"' <<<"$sid"
+check "  … instance id the job's id ($sid)" grep -qE '"sandbox_instance_id": "[0-9]+-[0-9a-f]{8}"' <<<"$sid"
 
 # ---- lanes: the show job above runs; headless work doesn't wait --------------
 t0=$(date +%s.%N)
@@ -115,7 +135,7 @@ took=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
 check "a headless job runs beside a show job (rc $rc, ${took}s)" \
   bash -c "[ $rc -eq 0 ] && awk -v t=$took 'BEGIN { exit !(t < 2) }' && ! grep -q 'queued behind' '$T/lane.log'"
 st=$(W status)
-check "status shows the show job in its lane" grep -q '^show: .*weston-flower' <<<"$st"
+check "status shows the show job in its lane (id only)" grep -qE '^show: [0-9]+-[0-9a-f]{8} \([0-9]+s\)$' <<<"$st"
 wait "$wpid"
 rc=$?
 check "the window job ends at its timeout (rc $rc)" [ $rc -eq 124 ]

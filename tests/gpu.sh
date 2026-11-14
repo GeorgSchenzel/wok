@@ -44,6 +44,8 @@ rm -rf "$T"
 mkdir -p "$T"
 WOK_JAIL_PATH=$jail_path "$wok" daemon --socket "$T/s" --state "$T/state" 2>"$T/daemon.log" &
 dpid=$!
+# stop our daemon (by its PID) however the script ends, Ctrl-C included
+trap 'kill "$dpid" 2>/dev/null' EXIT
 for _ in $(seq 50); do [ -S "$T/s" ] && break; sleep 0.1; done
 W() { (cd "$T" && WOK_SOCKET=$T/s "$wok" "$@"); }
 

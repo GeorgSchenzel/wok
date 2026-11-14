@@ -59,29 +59,65 @@ for p in / /etc /nix/store /usr /bin /sys; do
   check "$p is not writable" [ $? -ne 0 ]
 done
 check "the root dir is unchanged by write attempts" [ ! -e /wok-write-test ]
-for d in /tmp /dev/shm /run /var /srv /mnt /media /nix/var /home; do
-  [ -d "$d" ] || continue
+for d in /tmp /dev/shm /run /home; do
   check "$d is a private tmpfs" [ "$(J stat -f -c %T "$d")" = tmpfs ]
 done
+check "/tmp has a size (2 GiB)" [ "$(J sh -c 'echo $(( $(stat -f -c %b /tmp) * $(stat -f -c %S /tmp) ))')" = $((2 << 30)) ]
+check "/dev/shm has a size (1 GiB)" [ "$(J sh -c 'echo $(( $(stat -f -c %b /dev/shm) * $(stat -f -c %S /dev/shm) ))')" = $((1 << 30)) ]
 JS 'echo x > /tmp/t && echo x > /dev/shm/t'; check "/tmp and /dev/shm are writable" [ $? -eq 0 ]
 check "the jail's /tmp is not the host's" [ ! -e /tmp/t ] || [ "$(cat /tmp/t 2>/dev/null)" != x ]
 
-# ---- invisible -------------------------------------------------------------
-check "the host home is invisible" notJ test -e "$HOME"
-check "~/.ssh is invisible" notJ test -e "$HOME/.ssh"
-check "the job root's host path is invisible" notJ test -e "$T/root"
-check "/run/user/$uid is invisible" notJ test -e /run/user/$uid
-check "the X11 sockets are invisible" notJ test -e /tmp/.X11-unix
-check "the nix daemon socket is invisible" notJ test -e /nix/var/nix/daemon-socket/socket
-if [ -d /var/lib ] && [ -n "$(ls -A /var/lib)" ]; then
-  check "host /var/lib is invisible" [ -z "$(J ls -A /var/lib 2>/dev/null)" ]
+# ---- the filesystem is an allowlist ----------------------------------------
+# Not a list of hidden paths: everything the jail has must be on a short list,
+# so a host dir nobody thought of (/persist, /backups, a new mount) can't show.
+top=$(J ls -A / | sort | tr '\n' ' ')
+check "/ holds only the allowlist ($top)" bash -c '
+  for e in $1; do case $e in bin|dev|etc|home|lib64|nix|proc|run|sys|tmp|usr) ;; *) exit 1 ;; esac; done' _ "$top"
+check "/nix holds only the store" [ "$(J ls -A /nix)" = store ]
+check "/home holds only the job's home" [ "$(J ls -A /home)" = wok ]
+runs=$(J ls -A /run | tr '\n' ' ')
+check "/run holds only the GPU's driver links ($runs)" bash -c '
+  for e in $1; do case $e in current-system|opengl-driver|opengl-driver-32) ;; *) exit 1 ;; esac; done' _ "$runs"
+# every mount point: on the list, a device node, or a masked mount in /etc or /sys
+mounts=$(J cut -d' ' -f5 /proc/self/mountinfo | sort -u)
+badm=$(J sh -c '
+  for m in $(cut -d" " -f5 /proc/self/mountinfo | sort -u); do
+    case $m in
+      /|/bin|/dev|/dev/pts|/dev/shm|/etc|/home|/home/wok|/home/wok/job|/home/wok/out|/lib64|/nix/store|/proc|/run|/sys|/tmp|/usr) ;;
+      /run/current-system|/run/opengl-driver|/run/opengl-driver-32|/run/wok/wayland-0) ;;
+      /dev/*) [ -c "$m" ] || echo "$m" ;;
+      /etc/*|/sys/*)
+        if [ -d "$m" ]; then [ -z "$(ls -A "$m")" ] || echo "$m"
+        else [ "$(stat -c %t:%T "$m")" = 1:3 ] || echo "$m"; fi ;;
+      *) echo "$m" ;;
+    esac
+  done')
+check "every mount is on the allowlist or masked ($(wc -l <<<"$mounts") mounts; off it: [${badm//$'\n'/ }])" [ -z "$badm" ]
+# the host's own mounts inside /etc and /sys (persisted keys, efivars…) are masked
+host_sub=$(cut -d' ' -f5 /proc/self/mountinfo | grep -E '^/(etc|sys)/' | sort -u | head -20)
+if [ -n "$host_sub" ]; then
+  unmasked=$(J sh -c 'for m in "$@"; do if [ -d "$m" ]; then [ -z "$(ls -A "$m" 2>/dev/null)" ] || echo "$m"; elif [ -e "$m" ]; then [ "$(stat -c %t:%T "$m")" = 1:3 ] || echo "$m"; fi; done' _ $host_sub)
+  check "the host's mounts in /etc and /sys are masked ($(wc -l <<<"$host_sub") of them)" [ -z "$unmasked" ]
 fi
+# a canary written on the host, outside the allowlist: nowhere in the jail's
+# writable or host-backed trees (the store, /proc and /sys aside)
+canary=wok-fs-canary-$$-$RANDOM
+echo "$canary" > "$T/canary"
+check "a host canary file is unreachable" notJ grep -rqsF "$canary" /etc /usr /bin /run /home /tmp /dev/shm
+check "the job root's host path is invisible" notJ test -e "$T/root"
+for p in "$HOME" /persist /backups /root /boot /swap /var /srv /mnt /media /nix/var /run/user/$uid /tmp/.X11-unix; do
+  check "$p is absent" notJ test -e "$p"
+done
 
 # ---- network ---------------------------------------------------------------
 # /sys is the host's (read-only; GPU drivers read it), so ask the netns itself
 check "only lo in the jail's netns" [ "$(J sh -c "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' '")" = lo ]
 JS 'exec 3<>/dev/tcp/1.1.1.1/53' 2>/dev/null; check "no route out (tcp 1.1.1.1:53)" [ $? -ne 0 ]
 JS 'exec 3<>/dev/tcp/127.0.0.1/17760' 2>/dev/null; check "host loopback is unreachable (nix daemon port)" [ $? -ne 0 ]
+
+# ---- namespaces -------------------------------------------------------------
+check "no nested user namespaces" notJ unshare -U true
+check "own cgroup namespace" [ "$(J cat /proc/self/cgroup)" = "0::/" ]
 
 # ---- processes and tty -----------------------------------------------------
 J kill -0 $$ 2>/dev/null; check "host processes are invisible (own pid ns)" [ $? -ne 0 ]
@@ -97,8 +133,25 @@ check "nothing outlives the job" bash -c "! pgrep -f '[w]${marker#w}' >/dev/null
 
 # ---- GPU nodes (present, not exercised) ------------------------------------
 [ -e /dev/dri ] && check "/dev/dri is there" J test -d /dev/dri
+for n in /dev/dri/renderD*; do [ -c "$n" ] && check "$n is there" J test -c "$n"; done
+check "no DRM card (primary) nodes" J sh -c '! ls /dev/dri/card* 2>/dev/null | grep -q .'
+[ -c /dev/dri/renderD128 ] && check "the render node opens (read, no GPU work)" J sh -c 'exec 3</dev/dri/renderD128' 
 [ -e /dev/nvidiactl ] && check "/dev/nvidiactl is there" J test -c /dev/nvidiactl
 check "other devices are not (no /dev/sda, /dev/input)" J sh -c '! ls -d /dev/sd* /dev/nvme* /dev/input 2>/dev/null | grep -q .'
+
+# ---- limits (a transient user scope) ---------------------------------------
+scope=$(command -v systemd-run || true)
+if [ -n "$scope" ] && "$scope" --user --scope --quiet --collect -- true 2>/dev/null; then
+  JL() { WOK_SCOPE=$scope WOK_MEMORY_MAX=256M WOK_TASKS_MAX=64 WOK_DISPLAY=0 "$JAIL" "$T/root" -- "$@" </dev/null; }
+  check "the job runs in a scope of its own" bash -c "[ \"\$(WOK_SCOPE=$scope WOK_DISPLAY=0 '$JAIL' '$T/root' -- true </dev/null; echo \$?)\" = 0 ]"
+  JL sh -c 'head -c 600M /dev/zero > /tmp/fill && echo filled' >"$T/mem.log" 2>&1
+  rc=$?
+  check "memory is capped: 600M into tmpfs under a 256M cap is killed (rc $rc)" bash -c "[ $rc -ne 0 ] && ! grep -q filled '$T/mem.log'"
+  out=$(JL sh -c 'for i in $(seq 200); do sleep 3 & done 2>/dev/null; jobs -p | wc -l' 2>/dev/null)
+  check "tasks are capped: 200 forks under a cap of 64 (got ${out:-0})" bash -c "[ \"\${1:-0}\" -lt 200 ]" _ "$out"
+else
+  bad "no systemd user scope here: limits not checked"
+fi
 
 # ---- show mode (WOK_DISPLAY=show): one socket, nothing else ---------------
 # A stand-in for the daemon's listener on the desktop: a socket that answers
@@ -168,6 +221,26 @@ if [ -x "$wok" ]; then
   rc=$?
   check "daemon + jail: a timeout exits 124 (got $rc, $((SECONDS - t0))s)" [ $rc -eq 124 ]
   check "daemon + jail: a TERM-ignoring job is gone after its timeout" bash -c "! pgrep -f '[w]${mark#w}' >/dev/null"
+  # the timeout's TERM reaches the job, which may still write its results
+  (cd "$d" && WOK_SOCKET=$d/s "$wok" run --no-display --timeout 2 --out term -- \
+    sh -c 'trap "echo flushed > \$WOK_OUT/last; exit 0" TERM; sleep 60 & wait' >/dev/null 2>&1)
+  rc=$?
+  check "daemon + jail: a timeout TERMs the job first, its last write comes back (rc $rc)" \
+    bash -c "[ $rc -eq 124 ] && [ \"\$(cat '$d/term/last' 2>/dev/null)\" = flushed ]"
+  kill "$dpid"; wait "$dpid" 2>/dev/null
+  # a second daemon with a small disk cap: a job that writes past it is stopped
+  env -u WAYLAND_DISPLAY WOK_JOB_DISK_MAX=$((64 << 20)) "$wok" daemon --socket "$d/s2" --state "$d/state2" 2>"$d/log2" &
+  dpid=$!
+  for _ in $(seq 50); do [ -S "$d/s2" ] && break; sleep 0.1; done
+  t0=$SECONDS
+  err=$(cd "$d" && WOK_SOCKET=$d/s2 "$wok" run --no-display --out big -- \
+    sh -c 'for i in $(seq 200); do head -c 1M /dev/zero > $WOK_OUT/f$i; sleep 0.02; done' 2>&1 >/dev/null)
+  rc=$?
+  check "daemon + jail: a job past its disk cap is stopped with a reason (rc $rc, $((SECONDS - t0))s)" \
+    bash -c "[ $rc -eq 125 ] && grep -q 'stopped: it wrote more than 64 MiB' <<<\"\$1\"" _ "$err"
+  for _ in $(seq 50); do [ -z "$(ls -A "$d/state2/jobs")" ] && break; sleep 0.1; done
+  check "daemon + jail: its dir is gone" [ -z "$(ls -A "$d/state2/jobs")" ]
+  grep -q 'no systemd user scope' "$d/log2" && bad "daemon: no scope (no memory/task caps)" || ok "daemon: jobs get a scope (no warning in its log)"
   kill "$dpid"; wait "$dpid" 2>/dev/null
 else
   bad "target/debug/wok missing: cargo build first"

@@ -1,0 +1,48 @@
+# Wayland globals a --show job may be offered (tests/show.sh, tests/desktop.sh).
+# Anything else offered to a job fails those tests. One per line, with why.
+# Review an entry before adding it; privileged ones belong in PRIVILEGED in
+# src/wayland.rs instead (the daemon refuses --show when one leaks).
+wl_compositor                     surfaces
+wl_subcompositor                  subsurfaces
+wl_shm                            shared-memory buffers
+wl_output                         output geometry
+wl_seat                           input, delivered only while the job's window has focus
+wl_fixes                          protocol housekeeping
+xdg_wm_base                       toplevel windows
+zxdg_decoration_manager_v1        server-side decorations
+org_kde_kwin_server_decoration_manager  decorations (old)
+xdg_toplevel_tag_manager_v1       a tag for window rules
+zxdg_exporter_v1                  parenting across clients by handle
+zxdg_exporter_v2                  same
+zxdg_importer_v1                  same
+zxdg_importer_v2                  same
+wp_viewporter                     scaling
+wp_presentation                   frame timing
+wp_fractional_scale_manager_v1    scaling
+wp_single_pixel_buffer_manager_v1 solid-colour buffers
+wp_alpha_modifier_v1              surface alpha
+wp_content_type_manager_v1        content-type hints (game, video)
+wp_tearing_control_manager_v1     tearing for games
+wp_cursor_shape_manager_v1        cursor shapes
+wp_color_representation_manager_v1 colour metadata
+wp_color_manager_v1               colour management
+wp_fifo_manager_v1                frame pacing
+wp_commit_timing_manager_v1       frame pacing
+zwp_linux_dmabuf_v1               GPU buffers (the real session; pixman has none)
+wp_linux_drm_syncobj_manager_v1   explicit GPU sync
+wl_drm                            GPU buffers (mesa, old)
+zwp_pointer_constraints_v1        pointer lock for games, only while focused
+zwp_relative_pointer_manager_v1   mouse-look for games
+zwp_pointer_gestures_v1           touchpad gestures
+zwp_tablet_manager_v2             tablets
+zwp_idle_inhibit_manager_v1       keeps the screen on while the window is visible
+# Allowed, but they are what R4 finding 2 is about (work-wok.md, Review):
+wl_data_device_manager            clipboard: the focused window gets the current selection
+zwp_primary_selection_device_manager_v1  primary selection: same, on focus
+xdg_activation_v1                 a client may ask for focus (sway may grant it)
+zwp_text_input_manager_v3         input-method text, while focused
+ext_idle_notifier_v1              tells a client when the seat goes idle
+# Capture *sources* only: capturing needs ext_image_copy_capture_manager_v1,
+# which is hidden (PRIVILEGED).
+ext_output_image_capture_source_manager_v1
+ext_foreign_toplevel_image_capture_source_manager_v1

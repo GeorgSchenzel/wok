@@ -37,6 +37,18 @@ const MAX_ARGV_BYTES: usize = 128 * 1024;
 const UPLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// After a timeout or a hangup: TERM, then KILL after this.
 const KILL_GRACE: Duration = Duration::from_secs(5);
+/// A client that takes longer than this to accept a write is treated as gone
+/// (its job is stopped): a client that stops reading can't hold a lane. (A
+/// write that times out after sending part returns the part; the next one
+/// then fails, so a stalled client is noticed within two of these.)
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// What a job may leave on the host's disk (job/, out/, home/ together): the
+/// client's own results caps, so whatever fits here also arrives.
+const MAX_JOB_BYTES: u64 = 8 << 30;
+const MAX_JOB_ENTRIES: u64 = 200_000;
+/// A job is stopped when the state dir's filesystem gets this full.
+const MIN_FREE_BYTES: u64 = 1 << 30;
+const DISK_CHECK: Duration = Duration::from_secs(1);
 /// Names a job can't set: the jail and its compositor own them.
 const RESERVED_ENV: &[&str] = &["HOME", "PATH", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY"];
 
@@ -72,8 +84,13 @@ struct Shared {
     jail: PathBuf,
     connections: AtomicUsize,
     last_active: Mutex<Instant>,
-    /// The desktop's Wayland socket for `--show` (the daemon's WAYLAND_DISPLAY).
-    desktop: Option<PathBuf>,
+    /// systemd-run for a scope per job (memory and task caps), if usable.
+    scope: Option<PathBuf>,
+    /// Look the desktop up in the systemd user manager's environment
+    /// (`WOK_DESKTOP_ENV=systemd`, set by the unit), not the daemon's own.
+    desktop_from_systemd: bool,
+    /// MAX_JOB_BYTES, or less from $WOK_JOB_DISK_MAX (bytes; tests).
+    max_job_bytes: u64,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -113,8 +130,16 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         jail,
         connections: AtomicUsize::new(0),
         last_active: Mutex::new(Instant::now()),
-        desktop: wayland::desktop_socket(),
+        scope: find_scope(),
+        desktop_from_systemd: std::env::var_os("WOK_DESKTOP_ENV").is_some_and(|v| v == "systemd"),
+        max_job_bytes: std::env::var("WOK_JOB_DISK_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(MAX_JOB_BYTES, |v: u64| v.min(MAX_JOB_BYTES)),
     });
+    if shared.scope.is_none() {
+        eprintln!("wok: WARNING: no systemd user scope (systemd-run --user --scope); jobs run without memory and task caps");
+    }
 
     if let Some(idle) = cfg.idle_exit {
         let s = shared.clone();
@@ -203,6 +228,7 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
         Ok(Msg::Run(req)) => req,
         Ok(Msg::Status { .. }) => {
             let q = s.queue.lock().unwrap();
+            // ids and times only: any box may ask, and argv may carry secrets
             let running = |l: &Lane| {
                 l.running.as_ref().map(|(v, t)| JobView {
                     running_s: t.elapsed().as_secs(),
@@ -223,20 +249,22 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
         Ok(m) => return refuse(&mut w, &format!("unexpected first message {m:?}")),
         Err(e) => return refuse(&mut w, &format!("{e:#}")),
     };
+    // A refusal before the upload is read: read (and drop) the upload first,
+    // or closing with unread data resets the connection and the client sees
+    // "no daemon" instead of the reason.
     if let Err(e) = validate(&req) {
+        drain_upload(&mut r);
         return refuse(&mut w, &format!("{e:#}"));
     }
-    let desktop = match (req.show, &s.desktop) {
-        (false, _) => None,
-        (true, Some(d)) => Some(d.clone()),
-        (true, None) => return refuse(
+    if req.show && wayland::desktop_socket(s.desktop_from_systemd).is_none() {
+        drain_upload(&mut r);
+        return refuse(
             &mut w,
-            "--show: this wok daemon has no desktop session (WAYLAND_DISPLAY is not set in its environment)",
-        ),
-    };
+            "--show: this wok daemon has no desktop session (no WAYLAND_DISPLAY in its environment)",
+        );
+    }
 
-    let id = new_id();
-    let job = JobDir::create(&s.state.join("jobs").join(&id))?;
+    let (id, job) = JobDir::new_job(&s.state.join("jobs"))?;
     let lim = Limits {
         max_bytes: MAX_INPUT_BYTES,
         max_entries: MAX_INPUT_ENTRIES,
@@ -246,10 +274,10 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
         return refuse(&mut w, &format!("receiving the job's files: {e:#}"));
     }
     conn.set_read_timeout(None)?;
+    conn.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
 
     let view = JobView {
         id: id.clone(),
-        argv: req.argv.clone(),
         running_s: 0,
     };
     let lane = if req.show { SHOW } else { HEADLESS };
@@ -257,14 +285,29 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
         eprintln!("wok: job {id}: the client left while queued");
         return Ok(());
     };
-    // the job's own listener on the desktop, made at its turn, gone with it
-    let show = match &desktop {
-        None => None,
-        Some(d) => match wayland::listen(d, &job.root.join("wayland-0"), &id) {
+    // the job's own listener on the desktop, made at its turn (the desktop
+    // looked up again: sway may have restarted), gone with it
+    let show = if req.show {
+        let listened = wayland::desktop_socket(s.desktop_from_systemd)
+            .ok_or_else(|| anyhow::anyhow!("no desktop session (no WAYLAND_DISPLAY)"))
+            .and_then(|d| wayland::listen(&d, &job.root.join("wayland-0"), &id));
+        match listened {
             Ok(sh) => Some(sh),
             Err(e) => return refuse(&mut w, &format!("--show: {e:#}")),
-        },
+        }
+    } else {
+        None
     };
+    // two lanes share the GPU: say so, for anyone timing the job
+    let other = if req.show { HEADLESS } else { SHOW };
+    if s.queue.lock().unwrap().lanes[other].running.is_some() {
+        let note = if req.show {
+            "wok: note: a headless job is running beside this one on the GPU\n"
+        } else {
+            "wok: note: a --show job is running beside this one on the GPU (timings are shared)\n"
+        };
+        proto::send_stderr(&mut w, note.as_bytes())?;
+    }
     eprintln!(
         "wok: job {id} started{}: {:?}",
         if show.is_some() { " on the desktop" } else { "" },
@@ -276,6 +319,8 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
     let (exit, client_gone) = run_job(s, &job.root, &req, &mut w, &conn)?;
     drop(show); // the compositor stops accepting for this job
     drop(turn); // the next job may start while the results go out
+                // a job may leave dirs it made unreadable (chmod 000): ours to send and remove
+    own_tree(&job.root);
     eprintln!(
         "wok: job {id} done: {exit:?}{}",
         if client_gone { ", the client left" } else { "" }
@@ -300,6 +345,91 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
     }
     w.flush()?;
     Ok(())
+}
+
+/// Read the rest of an upload and drop it (bounded by the input limits and
+/// the read timeout), so a refusal isn't lost to a connection reset.
+fn drain_upload(r: &mut impl Read) {
+    let mut total: u64 = 0;
+    while let Ok(Some(f)) = proto::read_frame(r) {
+        total += match &f {
+            proto::Frame::Data(d) => d.len() as u64,
+            _ => 1,
+        };
+        if matches!(f, proto::Frame::Msg(Msg::End)) || total > MAX_INPUT_BYTES + MAX_INPUT_ENTRIES {
+            return;
+        }
+    }
+}
+
+/// systemd-run, if a user scope can be made with it ($WOK_SCOPE overrides:
+/// a path, or empty for none).
+fn find_scope() -> Option<PathBuf> {
+    let p = match std::env::var_os("WOK_SCOPE") {
+        Some(v) if v.is_empty() => return None,
+        Some(v) => PathBuf::from(v),
+        None => std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join("systemd-run"))
+                .find(|p| p.is_file())
+        })?,
+    };
+    let ok = Command::new(&p)
+        .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    ok.then_some(p)
+}
+
+/// Make every dir under `root` u+rwx and every file u+rw (never following
+/// links), after the job is gone.
+fn own_tree(root: &Path) {
+    let Ok(meta) = fs::symlink_metadata(root) else {
+        return;
+    };
+    if meta.is_dir() {
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = fs::set_permissions(root, fs::Permissions::from_mode(mode | 0o700));
+        }
+        if let Ok(rd) = fs::read_dir(root) {
+            for e in rd.flatten() {
+                own_tree(&e.path());
+            }
+        }
+    } else if meta.is_file() {
+        let mode = meta.permissions().mode();
+        if mode & 0o600 != 0o600 {
+            let _ = fs::set_permissions(root, fs::Permissions::from_mode(mode | 0o600));
+        }
+    }
+}
+
+/// Bytes and entries under `root` (no links followed), stopping early once
+/// either cap is passed.
+fn disk_use(root: &Path, max: u64, bytes: &mut u64, entries: &mut u64) {
+    let Ok(rd) = fs::read_dir(root) else { return };
+    for e in rd.flatten() {
+        if *bytes > max || *entries > MAX_JOB_ENTRIES {
+            return;
+        }
+        *entries += 1;
+        let Ok(m) = e.metadata() else { continue }; // DirEntry::metadata doesn't follow links
+        if m.is_dir() {
+            disk_use(&e.path(), max, bytes, entries);
+        } else {
+            *bytes += std::os::unix::fs::MetadataExt::blocks(&m) * 512;
+        }
+    }
+}
+
+fn free_bytes(p: &Path) -> Option<u64> {
+    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
 }
 
 fn refuse(w: &mut impl Write, msg: &str) -> anyhow::Result<()> {
@@ -366,6 +496,21 @@ struct JobDir {
 }
 
 impl JobDir {
+    /// A fresh id and its dir (ids are retried on a collision).
+    fn new_job(jobs: &Path) -> anyhow::Result<(String, JobDir)> {
+        for _ in 0..5 {
+            let id = new_id();
+            match JobDir::create(&jobs.join(&id)) {
+                Ok(j) => return Ok((id, j)),
+                Err(e)
+                    if e.downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::AlreadyExists) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        bail!("no free job id")
+    }
+
     fn create(root: &Path) -> anyhow::Result<JobDir> {
         fs::create_dir(root)?;
         let job = JobDir {
@@ -382,6 +527,10 @@ impl JobDir {
 impl Drop for JobDir {
     fn drop(&mut self) {
         // remove_dir_all doesn't follow links (std, since CVE-2022-21658)
+        if fs::remove_dir_all(&self.root).is_ok() {
+            return;
+        }
+        own_tree(&self.root);
         if let Err(e) = fs::remove_dir_all(&self.root) {
             eprintln!("wok: removing {}: {e}", self.root.display());
         }
@@ -450,29 +599,53 @@ fn wait_turn<'a>(
             }
             let _ = s.turn.wait_timeout(q, Duration::from_millis(500)).unwrap();
         }
-        if hung_up(conn.as_raw_fd()) {
+        if let Some(why) = client_left(conn.as_raw_fd()) {
+            eprintln!("wok: job {}: the client {why}", view.id);
             leave();
             return Ok(None);
         }
     }
 }
 
-/// The client sends nothing after its upload, so anything readable on the
-/// socket (EOF above all) means it is gone.
-fn hung_up(fd: RawFd) -> bool {
-    let mut p = libc::pollfd {
-        fd,
-        events: libc::POLLIN | libc::POLLRDHUP,
-        revents: 0,
+/// The client sends nothing after its upload: an EOF or error means it is
+/// gone, and data means it broke the protocol; either way its job goes.
+fn client_left(fd: RawFd) -> Option<&'static str> {
+    let mut b = [0u8; 1];
+    let n = unsafe {
+        libc::recv(
+            fd,
+            b.as_mut_ptr() as *mut _,
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
     };
-    unsafe { libc::poll(&mut p, 1, 0) > 0 }
+    match n {
+        0 => Some("hung up"),
+        n if n > 0 => Some("sent data after its upload (a protocol error)"),
+        _ => match io::Error::last_os_error().kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => None,
+            _ => Some("connection failed"),
+        },
+    }
 }
 
 fn spawn_jail(s: &Shared, root: &Path, req: &RunReq) -> io::Result<Child> {
     let mut cmd = Command::new("bash");
     cmd.arg(&s.jail).arg(root).arg("--").args(&req.argv);
     cmd.env_clear();
-    for k in ["PATH", "WOK_BWRAP", "WOK_JAIL_PATH"] {
+    if let Some(scope) = &s.scope {
+        cmd.env("WOK_SCOPE", scope);
+    }
+    // XDG_RUNTIME_DIR and the bus are for systemd-run (the jail clears them)
+    for k in [
+        "PATH",
+        "WOK_BWRAP",
+        "WOK_JAIL_PATH",
+        "WOK_MEMORY_MAX",
+        "WOK_TASKS_MAX",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+    ] {
         if let Some(v) = std::env::var_os(k) {
             cmd.env(k, v);
         }
@@ -535,8 +708,12 @@ fn run_job(
     let mut timed_out = false;
     let mut client_gone = false;
     let mut exited_at: Option<Instant> = None;
+    let mut stopped: Option<String> = None;
+    let mut next_disk_check = Instant::now() + DISK_CHECK;
     let mut buf = vec![0u8; 64 * 1024];
 
+    // TERM goes to the jail script, which passes it to the jail's pid 1 and
+    // so to every process in the jail; KILL takes the script and the jail
     let signal = |sig| unsafe { libc::kill(-pgid, sig) };
     loop {
         let mut fds = vec![libc::pollfd {
@@ -553,7 +730,7 @@ fn run_job(
         }
         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 200) };
 
-        if fds[0].revents != 0 && !client_gone {
+        if fds[0].revents != 0 && !client_gone && client_left(conn.as_raw_fd()).is_some() {
             client_gone = true;
             if killed_at.is_none() {
                 signal(libc::SIGTERM);
@@ -587,6 +764,26 @@ fn run_job(
         }
 
         let now = Instant::now();
+        if killed_at.is_none() && now >= next_disk_check {
+            next_disk_check = now + DISK_CHECK;
+            let (mut bytes, mut entries) = (0, 0);
+            disk_use(root, s.max_job_bytes, &mut bytes, &mut entries);
+            let why = if bytes > s.max_job_bytes || entries > MAX_JOB_ENTRIES {
+                Some(format!(
+                    "it wrote more than {} MiB or {MAX_JOB_ENTRIES} files to its dirs",
+                    s.max_job_bytes >> 20
+                ))
+            } else if free_bytes(root).is_some_and(|f| f < MIN_FREE_BYTES) {
+                Some("the host's disk is nearly full".into())
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                stopped = Some(why);
+                signal(libc::SIGTERM);
+                killed_at = Some(now);
+            }
+        }
         if killed_at.is_none() && now >= deadline {
             timed_out = true;
             signal(libc::SIGTERM);
@@ -610,15 +807,19 @@ fn run_job(
         code: status.code(),
         signal: status.signal(),
         timed_out,
+        stopped,
     };
     Ok((exit, client_gone))
 }
 
 fn new_id() -> String {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let mut r = [0u8; 2];
+    let mut r = [0u8; 4];
     let _ = fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut r));
-    format!("{secs}-{:02x}{:02x}", r[0], r[1])
+    format!(
+        "{secs}-{}",
+        r.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
 }
 
 pub fn default_state() -> anyhow::Result<PathBuf> {

@@ -53,12 +53,16 @@ pub struct ExitInfo {
     pub code: Option<i32>,
     pub signal: Option<i32>,
     pub timed_out: bool,
+    /// Why wok stopped the job, when it did for a reason other than time.
+    #[serde(default)]
+    pub stopped: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// What status shows of a job: no argv (any box may ask; argv may carry
+/// paths or tokens).
 pub struct JobView {
     pub id: String,
-    pub argv: Vec<String>,
     pub running_s: u64,
 }
 

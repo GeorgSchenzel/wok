@@ -25,13 +25,26 @@ wok status
   The job gets its own listener on the compositor through the
   security-context protocol (sandbox engine `wok`, app id `wok`, instance id
   the job's id; sway criteria `[sandbox_engine="wok"]` match its windows), so
-  sway hides its privileged protocols from it: no screencopy, clipboard
-  managers, virtual keyboard or pointer, layer shell, toplevel lists. The
-  session's own socket stays invisible; still no X11, no sound. No
-  `--screenshot` with it. Needs sway 1.9+ and the daemon's `WAYLAND_DISPLAY`
-  (from the systemd user environment, which sway imports).
+  sway hides its privileged protocols from it: no screencopy, background
+  clipboard access (data control), virtual keyboard or pointer, layer shell,
+  toplevel lists; the daemon checks that through the job's listener and
+  refuses otherwise. **Not hidden:** like any window, while it has keyboard
+  focus the job gets the keys typed into it and the current clipboard and
+  primary selection, and sway focuses new windows by default. The session's
+  own socket stays invisible; still no X11, no sound. No `--screenshot` with
+  it. Needs sway 1.9+ and `WAYLAND_DISPLAY` (under systemd, read from the user
+  manager's environment for each job).
+- Limits: each job runs in a transient systemd user scope (memory 8G, 1024
+  tasks by default; tmpfs counts as memory); its dirs on disk are capped at
+  8 GiB / 200k entries (and it is stopped when the disk is nearly full); a
+  client that stops reading for ~10–20 s loses its job.
+- The jail's filesystem is an allowlist: /nix/store, /etc, /usr, /bin,
+  /lib64, /sys read-only (host mounts inside /etc and /sys masked), the GPU's
+  render and NVIDIA nodes, private tmpfs elsewhere. Nothing else of the host.
 - Results never include links or special files a job made (named on stderr).
-- Exit status: the job's; 124 timed out (`--timeout`, default 600, max 3600);
+- Exit status: the job's; 124 timed out (`--timeout`, default 600, max 3600;
+  the job gets a TERM, then a KILL 5 s later); 125 also when wok stopped it
+  (the reason on stderr);
   69 no daemon; 125 wok's own errors. A client that goes away takes its job
   with it.
 - The socket: `$WOK_SOCKET`, else `/run/bento/wok.sock` (bento's `wok`
