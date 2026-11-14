@@ -1,7 +1,11 @@
-//! `wok daemon`: one socket, one job at a time, FIFO. A connection uploads
-//! its files into a private job dir, waits its turn, runs in the jail with its
-//! output streamed back live, then gets `/out` back and the job dir is
-//! removed. The daemon needs no paths from the caller and no box identity.
+//! `wok daemon`: one socket, one job at a time per lane, FIFO. A connection
+//! uploads its files into a private job dir, waits its turn, runs in the jail
+//! with its output streamed back live, then gets `/out` back and the job dir
+//! is removed. The daemon needs no paths from the caller and no box identity.
+//!
+//! Two lanes: headless jobs, and `--show` jobs on the desktop's session. A
+//! show job is watched (or played) for as long as it takes, so it gets a lane
+//! of its own and never holds up the headless queue, nor waits for it.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -20,6 +24,7 @@ use anyhow::{bail, Context as _};
 
 use crate::proto::{self, ExitInfo, JobView, Limits, Links, Msg, RunReq};
 use crate::safefs::Dir;
+use crate::wayland;
 
 const JAIL_SCRIPT: &str = include_str!("jail.sh");
 
@@ -46,10 +51,18 @@ pub struct Config {
 }
 
 #[derive(Default)]
-struct Queue {
-    next_ticket: u64,
+struct Lane {
     waiting: VecDeque<u64>,
     running: Option<(JobView, Instant)>,
+}
+
+const HEADLESS: usize = 0;
+const SHOW: usize = 1;
+
+#[derive(Default)]
+struct Queue {
+    next_ticket: u64,
+    lanes: [Lane; 2],
 }
 
 struct Shared {
@@ -59,6 +72,8 @@ struct Shared {
     jail: PathBuf,
     connections: AtomicUsize,
     last_active: Mutex<Instant>,
+    /// The desktop's Wayland socket for `--show` (the daemon's WAYLAND_DISPLAY).
+    desktop: Option<PathBuf>,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -98,6 +113,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         jail,
         connections: AtomicUsize::new(0),
         last_active: Mutex::new(Instant::now()),
+        desktop: wayland::desktop_socket(),
     });
 
     if let Some(idle) = cfg.idle_exit {
@@ -187,15 +203,19 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
         Ok(Msg::Run(req)) => req,
         Ok(Msg::Status { .. }) => {
             let q = s.queue.lock().unwrap();
-            let running = q.running.as_ref().map(|(v, t)| JobView {
-                running_s: t.elapsed().as_secs(),
-                ..v.clone()
-            });
+            let running = |l: &Lane| {
+                l.running.as_ref().map(|(v, t)| JobView {
+                    running_s: t.elapsed().as_secs(),
+                    ..v.clone()
+                })
+            };
             proto::send(
                 &mut w,
                 &Msg::StatusReply {
-                    running,
-                    queued: q.waiting.len(),
+                    running: running(&q.lanes[HEADLESS]),
+                    queued: q.lanes[HEADLESS].waiting.len(),
+                    show: running(&q.lanes[SHOW]),
+                    show_queued: q.lanes[SHOW].waiting.len(),
                 },
             )?;
             return Ok(w.flush()?);
@@ -206,6 +226,14 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
     if let Err(e) = validate(&req) {
         return refuse(&mut w, &format!("{e:#}"));
     }
+    let desktop = match (req.show, &s.desktop) {
+        (false, _) => None,
+        (true, Some(d)) => Some(d.clone()),
+        (true, None) => return refuse(
+            &mut w,
+            "--show: this wok daemon has no desktop session (WAYLAND_DISPLAY is not set in its environment)",
+        ),
+    };
 
     let id = new_id();
     let job = JobDir::create(&s.state.join("jobs").join(&id))?;
@@ -224,15 +252,29 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
         argv: req.argv.clone(),
         running_s: 0,
     };
-    let Some(turn) = wait_turn(s, &mut w, &conn, view)? else {
+    let lane = if req.show { SHOW } else { HEADLESS };
+    let Some(turn) = wait_turn(s, lane, &mut w, &conn, view)? else {
         eprintln!("wok: job {id}: the client left while queued");
         return Ok(());
     };
-    eprintln!("wok: job {id} started: {:?}", req.argv);
+    // the job's own listener on the desktop, made at its turn, gone with it
+    let show = match &desktop {
+        None => None,
+        Some(d) => match wayland::listen(d, &job.root.join("wayland-0"), &id) {
+            Ok(sh) => Some(sh),
+            Err(e) => return refuse(&mut w, &format!("--show: {e:#}")),
+        },
+    };
+    eprintln!(
+        "wok: job {id} started{}: {:?}",
+        if show.is_some() { " on the desktop" } else { "" },
+        req.argv
+    );
     proto::send(&mut w, &Msg::Started { id: id.clone() })?;
     w.flush()?;
 
     let (exit, client_gone) = run_job(s, &job.root, &req, &mut w, &conn)?;
+    drop(show); // the compositor stops accepting for this job
     drop(turn); // the next job may start while the results go out
     eprintln!(
         "wok: job {id} done: {exit:?}{}",
@@ -304,6 +346,9 @@ fn validate(req: &RunReq) -> anyhow::Result<()> {
             bail!("{k} is set by wok, not by the job");
         }
     }
+    if req.show && (!req.display || req.screenshot_s.is_some()) {
+        bail!("--show needs the display and takes no screenshot (it would be of the desktop)");
+    }
     if let Some(shot) = req.screenshot_s {
         if !req.display {
             bail!("a screenshot needs the display");
@@ -343,12 +388,12 @@ impl Drop for JobDir {
     }
 }
 
-/// Holds the GPU while alive.
-struct Turn<'a>(&'a Shared);
+/// Holds a lane while alive.
+struct Turn<'a>(&'a Shared, usize);
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
-        self.0.queue.lock().unwrap().running = None;
+        self.0.queue.lock().unwrap().lanes[self.1].running = None;
         self.0.turn.notify_all();
     }
 }
@@ -357,6 +402,7 @@ impl Drop for Turn<'_> {
 /// client hangs up while waiting.
 fn wait_turn<'a>(
     s: &'a Shared,
+    lane: usize,
     w: &mut impl Write,
     conn: &UnixStream,
     view: JobView,
@@ -365,24 +411,25 @@ fn wait_turn<'a>(
         let mut q = s.queue.lock().unwrap();
         let t = q.next_ticket;
         q.next_ticket += 1;
-        q.waiting.push_back(t);
+        q.lanes[lane].waiting.push_back(t);
         t
     };
     let leave = || {
         let mut q = s.queue.lock().unwrap();
-        q.waiting.retain(|t| *t != ticket);
+        q.lanes[lane].waiting.retain(|t| *t != ticket);
         s.turn.notify_all();
     };
     let mut told = None;
     loop {
         {
             let mut q = s.queue.lock().unwrap();
-            let ahead = q.waiting.iter().position(|t| *t == ticket).unwrap() + q.running.is_some() as usize;
+            let l = &mut q.lanes[lane];
+            let ahead = l.waiting.iter().position(|t| *t == ticket).unwrap() + l.running.is_some() as usize;
             // told at least once (the client learns the id), then on changes
             if told.is_some() && ahead == 0 {
-                q.waiting.pop_front();
-                q.running = Some((view, Instant::now()));
-                return Ok(Some(Turn(s)));
+                l.waiting.pop_front();
+                l.running = Some((view, Instant::now()));
+                return Ok(Some(Turn(s, lane)));
             }
             if told != Some(ahead) {
                 told = Some(ahead);
@@ -430,7 +477,15 @@ fn spawn_jail(s: &Shared, root: &Path, req: &RunReq) -> io::Result<Child> {
             cmd.env(k, v);
         }
     }
-    cmd.env("WOK_DISPLAY", if req.display { "1" } else { "0" });
+    let display = match (req.display, req.show) {
+        (_, true) => "show",
+        (true, false) => "1",
+        (false, false) => "0",
+    };
+    cmd.env("WOK_DISPLAY", display);
+    if req.show {
+        cmd.env("WOK_SHOW_SOCKET", root.join("wayland-0"));
+    }
     if let Some(shot) = req.screenshot_s {
         cmd.env("WOK_SCREENSHOT", format!("{shot}"));
     }
@@ -589,12 +644,14 @@ mod tests {
             timeout_s: 10,
             display: true,
             screenshot_s: None,
+            show: false,
         }
     }
 
     #[test]
     fn validation() {
         assert!(validate(&req()).is_ok());
+        assert!(validate(&RunReq { show: true, ..req() }).is_ok());
         let bad = [
             RunReq {
                 argv: vec![],
@@ -638,6 +695,16 @@ mod tests {
                 ..req()
             },
             RunReq { v: 99, ..req() },
+            RunReq {
+                show: true,
+                display: false,
+                ..req()
+            },
+            RunReq {
+                show: true,
+                screenshot_s: Some(2.0),
+                ..req()
+            },
         ];
         for r in bad {
             assert!(validate(&r).is_err(), "{r:?} must be refused");

@@ -100,12 +100,57 @@ check "nothing outlives the job" bash -c "! pgrep -f '[w]${marker#w}' >/dev/null
 [ -e /dev/nvidiactl ] && check "/dev/nvidiactl is there" J test -c /dev/nvidiactl
 check "other devices are not (no /dev/sda, /dev/input)" J sh -c '! ls -d /dev/sd* /dev/nvme* /dev/input 2>/dev/null | grep -q .'
 
+# ---- show mode (WOK_DISPLAY=show): one socket, nothing else ---------------
+# A stand-in for the daemon's listener on the desktop: a socket that answers
+# "hi". The real compositor and its security context are tests/show.sh.
+py=$(command -v python3 || true)
+if [ -n "$py" ]; then
+  fresh
+  sock=$T/show.sock
+  "$py" -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(4)
+while True:
+    c, _ = s.accept(); c.sendall(b"hi"); c.close()
+' "$sock" &
+  spid=$!
+  for _ in $(seq 50); do [ -S "$sock" ] && break; sleep 0.1; done
+  JW() { WOK_DISPLAY=show WOK_SHOW_SOCKET=$sock "$JAIL" "$T/root" -- "$@" </dev/null; }
+  notJW() { ! JW "$@" 2>/dev/null; }
+  check "show: WAYLAND_DISPLAY is wayland-0, no DISPLAY" [ "$(JW sh -c 'echo "$WAYLAND_DISPLAY [${DISPLAY:-}]"')" = "wayland-0 []" ]
+  check "show: the runtime dir holds only wayland-0" [ "$(JW ls -A /run/wok)" = wayland-0 ]
+  check "show: wayland-0 reaches the daemon's listener" [ "$(JW "$py" -c '
+import socket; s = socket.socket(socket.AF_UNIX); s.connect("/run/wok/wayland-0"); print(s.recv(2).decode())')" = hi ]
+  check "show: the runtime dir is private" [ "$(JW stat -c %a /run/wok)" = 700 ]
+  check "show: /run/user/$uid is invisible" notJW test -e /run/user/$uid
+  check "show: the X11 sockets are invisible" notJW test -e /tmp/.X11-unix
+  check "show: the listener's host path is invisible" notJW test -e "$sock"
+  names=$(JW sh -c 'env | cut -d= -f1 | sort | tr "\n" " "')
+  check "show: the env is the jail's plus WAYLAND_DISPLAY ($names)" \
+    [ "$names" = "HOME LANG PATH PWD SHLVL TERM TMPDIR USER WAYLAND_DISPLAY WOK_OUT XDG_CACHE_HOME XDG_RUNTIME_DIR _ " ]
+  WOK_DISPLAY=show "$JAIL" "$T/root" -- true 2>/dev/null
+  check "show: no socket exits 252" [ $? -eq 252 ]
+  : > "$T/notasock"
+  WOK_DISPLAY=show WOK_SHOW_SOCKET=$T/notasock "$JAIL" "$T/root" -- true 2>/dev/null
+  check "show: a plain file exits 252" [ $? -eq 252 ]
+  ln -s "$sock" "$T/link.sock"
+  WOK_DISPLAY=show WOK_SHOW_SOCKET=$T/link.sock "$JAIL" "$T/root" -- true 2>/dev/null
+  check "show: a link exits 252" [ $? -eq 252 ]
+  WOK_SCREENSHOT=1 JW true 2>/dev/null
+  check "show: a screenshot exits 252" [ $? -eq 252 ]
+  WOK_DISPLAY=bogus "$JAIL" "$T/root" -- true 2>/dev/null
+  check "a bad WOK_DISPLAY exits 252" [ $? -eq 252 ]
+  kill "$spid"; wait "$spid" 2>/dev/null
+else
+  bad "python3 missing: show-mode checks skipped"
+fi
+
 # ---- the daemon with the real jail -----------------------------------------
 wok=$here/target/debug/wok
 if [ -x "$wok" ]; then
   d=$T/daemon
   mkdir -p "$d"
-  "$wok" daemon --socket "$d/s" --state "$d/state" 2>"$d/log" &
+  env -u WAYLAND_DISPLAY "$wok" daemon --socket "$d/s" --state "$d/state" 2>"$d/log" &
   dpid=$!
   for _ in $(seq 50); do [ -S "$d/s" ] && break; sleep 0.1; done
   mkdir -p "$d/in" && echo hello > "$d/in/greeting"

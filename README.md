@@ -10,6 +10,7 @@ go in over the socket and results come back over it.
 wok run --in build/ --screenshot 3 -- ./game     # → wok-out/<id>/screenshot.png
 wok run --in . --out shots -- sh -c 'render --out $WOK_OUT/frame.png'
 wok run --no-display -- vulkaninfo --summary
+wok run --in build/ --show -- ./game                 # on the desktop's sway, to play it
 wok status
 ```
 
@@ -18,6 +19,17 @@ wok status
   no tty; only its own dirs are writable. Details: `src/jail.sh`.
 - `--screenshot S`: the job runs in the background, `grim` takes
   `$WOK_OUT/screenshot.png` after S seconds, then the job is stopped.
+- `--show`: the job's windows go to the desktop's sway session instead of a
+  headless display, so you can see and play it. It has its own lane: one
+  show job at a time, and it never waits for headless jobs nor holds them up.
+  The job gets its own listener on the compositor through the
+  security-context protocol (sandbox engine `wok`, app id `wok`, instance id
+  the job's id; sway criteria `[sandbox_engine="wok"]` match its windows), so
+  sway hides its privileged protocols from it: no screencopy, clipboard
+  managers, virtual keyboard or pointer, layer shell, toplevel lists. The
+  session's own socket stays invisible; still no X11, no sound. No
+  `--screenshot` with it. Needs sway 1.9+ and the daemon's `WAYLAND_DISPLAY`
+  (from the systemd user environment, which sway imports).
 - Results never include links or special files a job made (named on stderr).
 - Exit status: the job's; 124 timed out (`--timeout`, default 600, max 3600);
   69 no daemon; 125 wok's own errors. A client that goes away takes its job
@@ -46,3 +58,8 @@ chunks, stdout/stderr chunks. No message relies on a half-close or on EOF. See
 - `just jail-test`: the jail's properties with bwrap, no display (on the host).
 - `just gpu-test`: the display, the GPU, a screenshot, and that the desktop
   session is untouched (on the GPU machine).
+- `just show-test`: `--show` against a private headless sway (pixman, no
+  GPU), never the desktop's: privileged globals hidden, the window tagged,
+  the lanes.
+- `just show-desktop`: `--show` on the real session; opens vkcube there for
+  15 s (run it from a terminal in the session).

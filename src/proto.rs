@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::safefs::{self, Dir, Kind};
 
-pub const VERSION: u32 = 1;
+/// 2: `show` in a run, the show lane in a status reply.
+pub const VERSION: u32 = 2;
 /// Largest frame payload accepted; data goes in chunks well below it.
 pub const MAX_FRAME: usize = 1 << 20;
 const CHUNK: usize = 256 * 1024;
@@ -41,6 +42,10 @@ pub struct RunReq {
     /// Take a screenshot this many seconds after start, then stop the job.
     #[serde(default)]
     pub screenshot_s: Option<f64>,
+    /// Run on the desktop's session (`--show`) instead of a headless one, in
+    /// the show lane. Needs `display`, excludes a screenshot.
+    #[serde(default)]
+    pub show: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -61,17 +66,46 @@ pub struct JobView {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Msg {
     Run(RunReq),
-    Status { v: u32 },
-    StatusReply { running: Option<JobView>, queued: usize },
-    Dir { path: String },
-    File { path: String, size: u64, exec: bool },
-    Link { path: String, target: String },
-    Skipped { path: String, why: String },
+    Status {
+        v: u32,
+    },
+    StatusReply {
+        running: Option<JobView>,
+        queued: usize,
+        /// The show lane (`--show` jobs), beside the headless one.
+        #[serde(default)]
+        show: Option<JobView>,
+        #[serde(default)]
+        show_queued: usize,
+    },
+    Dir {
+        path: String,
+    },
+    File {
+        path: String,
+        size: u64,
+        exec: bool,
+    },
+    Link {
+        path: String,
+        target: String,
+    },
+    Skipped {
+        path: String,
+        why: String,
+    },
     End,
-    Queued { id: String, ahead: usize },
-    Started { id: String },
+    Queued {
+        id: String,
+        ahead: usize,
+    },
+    Started {
+        id: String,
+    },
     Exit(ExitInfo),
-    Error { msg: String },
+    Error {
+        msg: String,
+    },
 }
 
 #[derive(Debug)]
@@ -351,6 +385,7 @@ mod tests {
             timeout_s: 5,
             display: true,
             screenshot_s: Some(1.5),
+            show: false,
         });
         send(&mut wire, &run).unwrap();
         send_stdout(&mut wire, b"out").unwrap();

@@ -2,6 +2,7 @@ mod client;
 mod daemon;
 mod proto;
 mod safefs;
+mod wayland;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,7 +27,7 @@ enum Cmd {
     /// of --in, ~/job in a scratch home. Whatever it writes to $WOK_OUT
     /// (~/out) comes back to --out, except links and special files. stdout
     /// and stderr stream live. No network; the GPU and, unless --no-display,
-    /// a headless Wayland display (no X11).
+    /// a headless Wayland display (no X11), or with --show the desktop's.
     #[command(verbatim_doc_comment)]
     Run {
         /// Upload this dir as the job's cwd. Default: an empty one.
@@ -45,6 +46,12 @@ enum Cmd {
         /// No headless compositor (compute only).
         #[arg(long, conflicts_with = "screenshot")]
         no_display: bool,
+        /// Run on the desktop's sway session instead of a headless display,
+        /// to see and play it. Its own lane: neither waits for headless jobs
+        /// nor holds them up. Sandboxed there (no screencopy, clipboard
+        /// managers, virtual input); still no X11.
+        #[arg(long, conflicts_with_all = ["screenshot", "no_display"])]
+        show: bool,
         /// Set an env var for the job (repeatable).
         #[arg(short = 'e', long = "env", value_name = "K=V", value_parser = parse_env)]
         env: Vec<(String, String)>,
@@ -52,7 +59,7 @@ enum Cmd {
         #[arg(last = true, required = true, value_name = "CMD")]
         argv: Vec<String>,
     },
-    /// What the daemon is running and how many jobs wait.
+    /// What the daemon is running and how many jobs wait, per lane.
     Status,
     /// The daemon (on the GPU machine). Without --socket it takes the socket
     /// systemd passes (wok.socket).
@@ -87,6 +94,7 @@ fn main() {
             timeout,
             screenshot,
             no_display,
+            show,
             env,
             argv,
         } => client::run(client::RunOpts {
@@ -99,6 +107,7 @@ fn main() {
                 timeout_s: timeout,
                 display: !no_display,
                 screenshot_s: screenshot,
+                show,
             },
         }),
         Cmd::Status => client::status(),

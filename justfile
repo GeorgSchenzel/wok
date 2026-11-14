@@ -17,3 +17,13 @@ gpu-test:
 lint:
     nix develop -c cargo clippy --all-targets
     nix develop -c cargo fmt --check
+
+# --show against a private headless sway (pixman, no GPU), never the desktop's
+show-test:
+    nix develop -c cargo build
+    nix develop -c bash tests/show.sh
+
+# --show on the real desktop session: opens a window there (Georg's gate)
+show-desktop:
+    nix develop -c cargo build
+    nix develop -c bash tests/desktop.sh

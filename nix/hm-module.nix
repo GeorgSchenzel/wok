@@ -8,7 +8,8 @@ self:
 
 # The daemon on the GPU machine: socket-activated on
 # ~/.local/share/wok/wok.sock (bento's global `wok` channel points there),
-# exits when idle.
+# exits when idle. `--show` jobs use WAYLAND_DISPLAY from the systemd user
+# environment (sway's session imports it); without it they're refused.
 let
   cfg = config.services.wok;
 in

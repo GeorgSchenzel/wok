@@ -105,12 +105,20 @@ fn status_inner(sock: &Path) -> Result<(), Failure> {
         .and_then(|_| w.flush())
         .map_err(|e| Failure::NoDaemon(e.to_string()))?;
     match first_reply(&mut BufReader::new(conn))? {
-        Frame::Msg(Msg::StatusReply { running, queued }) => {
-            match running {
-                Some(j) => println!("running: {} ({}s) {}", j.id, j.running_s, shell_words(&j.argv)),
-                None => println!("running: nothing"),
-            }
+        Frame::Msg(Msg::StatusReply {
+            running,
+            queued,
+            show,
+            show_queued,
+        }) => {
+            let job = |j: Option<proto::JobView>| match j {
+                Some(j) => format!("{} ({}s) {}", j.id, j.running_s, shell_words(&j.argv)),
+                None => "nothing".into(),
+            };
+            println!("running: {}", job(running));
             println!("queued: {queued}");
+            println!("show: {}", job(show));
+            println!("show queued: {show_queued}");
             Ok(())
         }
         Frame::Msg(Msg::Error { msg }) => Err(Failure::Wok(msg)),

@@ -3,10 +3,11 @@
 //! are tests/jail.sh and tests/gpu.sh, on the host.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const WOK: &str = env!("CARGO_BIN_EXE_wok");
@@ -20,6 +21,12 @@ struct Daemon {
 
 impl Daemon {
     fn start() -> Daemon {
+        Daemon::start_with(None)
+    }
+
+    /// `desktop`: the daemon's WAYLAND_DISPLAY. Never the real session's:
+    /// a test daemon doesn't inherit it.
+    fn start_with(desktop: Option<&Path>) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("wok.sock");
         let state = dir.path().join("state");
@@ -31,6 +38,8 @@ impl Daemon {
             .arg(&state)
             .arg("--jail")
             .arg(jail)
+            .env_remove("WAYLAND_DISPLAY")
+            .envs(desktop.map(|d| ("WAYLAND_DISPLAY", d)))
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
@@ -284,7 +293,10 @@ fn status_when_idle() {
     let t = tempfile::tempdir().unwrap();
     let o = d.run(&["status"], t.path());
     assert!(o.status.success());
-    assert_eq!(s(&o.stdout), "running: nothing\nqueued: 0\n");
+    assert_eq!(
+        s(&o.stdout),
+        "running: nothing\nqueued: 0\nshow: nothing\nshow queued: 0\n"
+    );
 }
 
 #[test]
@@ -350,7 +362,6 @@ fn one_daemon_per_state_dir() {
 #[test]
 fn an_upload_that_tries_to_escape_is_refused() {
     // a hand-made client: a file entry with a path out of the job dir
-    use std::io::Write;
     let d = Daemon::start();
     let mut c = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
     let frame = |c: &mut std::os::unix::net::UnixStream, tag: u8, p: &[u8]| {
@@ -361,7 +372,7 @@ fn an_upload_that_tries_to_escape_is_refused() {
     frame(
         &mut c,
         b'J',
-        br#"{"t":"run","v":1,"argv":["true"],"timeout_s":5,"display":false}"#,
+        br#"{"t":"run","v":2,"argv":["true"],"timeout_s":5,"display":false}"#,
     );
     frame(
         &mut c,
@@ -375,4 +386,170 @@ fn an_upload_that_tries_to_escape_is_refused() {
     assert!(s(&reply).contains("bad path"), "{}", s(&reply));
     assert!(!d.state.join("escaped").exists() && !d.state.parent().unwrap().join("escaped").exists());
     assert_eq!(d.job_dirs(), 0);
+}
+
+/// A compositor stand-in for `--show`: announces the security-context
+/// manager, answers syncs, and records each listener's instance id.
+fn fake_compositor(path: &Path) -> Arc<Mutex<Vec<String>>> {
+    let l = UnixListener::bind(path).unwrap();
+    let ids = Arc::new(Mutex::new(Vec::new()));
+    let ids2 = ids.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { return };
+            let ids = ids2.clone();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = match c.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&chunk[..n]);
+                    while buf.len() >= 8 {
+                        let obj = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+                        let w = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
+                        let size = (w >> 16) as usize;
+                        if buf.len() < size {
+                            break;
+                        }
+                        let body = buf[8..size].to_vec();
+                        buf.drain(..size);
+                        let op = w & 0xffff;
+                        let msg = |obj: u32, op: u32, body: &[u8]| {
+                            let mut m = obj.to_ne_bytes().to_vec();
+                            m.extend((((8 + body.len()) as u32) << 16 | op).to_ne_bytes());
+                            m.extend(body);
+                            m
+                        };
+                        let out = match (obj, op) {
+                            (1, 1) => {
+                                let name = b"wp_security_context_manager_v1\0\0";
+                                let mut b = 1u32.to_ne_bytes().to_vec();
+                                b.extend(31u32.to_ne_bytes());
+                                b.extend(name);
+                                b.extend(1u32.to_ne_bytes());
+                                msg(2, 0, &b)
+                            }
+                            (1, 0) => msg(u32::from_ne_bytes(body[0..4].try_into().unwrap()), 0, &[0; 4]),
+                            (5, 3) => {
+                                let len = u32::from_ne_bytes(body[0..4].try_into().unwrap()) as usize;
+                                ids.lock()
+                                    .unwrap()
+                                    .push(String::from_utf8_lossy(&body[4..3 + len]).into());
+                                vec![]
+                            }
+                            _ => vec![],
+                        };
+                        if c.write_all(&out).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    ids
+}
+
+#[test]
+fn show_runs_with_its_own_listener_on_the_desktop() {
+    let t = tempfile::tempdir().unwrap();
+    let desktop = t.path().join("wayland-7");
+    let ids = fake_compositor(&desktop);
+    let d = Daemon::start_with(Some(&desktop));
+    let o = d.run(
+        &[
+            "run",
+            "--show",
+            "--",
+            "sh",
+            "-c",
+            "[ \"$WOK_DISPLAY\" = show ] && [ -S \"$WOK_SHOW_SOCKET\" ] && echo shown",
+        ],
+        t.path(),
+    );
+    assert!(o.status.success(), "{}", s(&o.stderr));
+    assert_eq!(s(&o.stdout), "shown\n");
+    let ids = ids.lock().unwrap().clone();
+    assert_eq!(ids.len(), 1, "one listener per job: {ids:?}");
+    assert!(ids[0].contains('-'), "tagged with the job id: {ids:?}");
+    assert_eq!(d.job_dirs(), 0, "the job's socket and dir are gone");
+}
+
+#[test]
+fn show_has_its_own_lane() {
+    let t = tempfile::tempdir().unwrap();
+    let desktop = t.path().join("wayland-7");
+    let _ids = fake_compositor(&desktop);
+    let d = Daemon::start_with(Some(&desktop));
+    // a long show job, then a headless one: the headless one doesn't wait
+    let show = d
+        .wok(&["run", "--show", "--", "sleep", "5"])
+        .current_dir(t.path())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !s(&d.run(&["status"], t.path()).stdout).contains("show: ")
+        || s(&d.run(&["status"], t.path()).stdout).contains("show: nothing")
+    {
+        assert!(Instant::now() < deadline, "the show job never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let start = Instant::now();
+    let o = d.run(&["run", "--no-display", "--", "true"], t.path());
+    assert!(o.status.success(), "{}", s(&o.stderr));
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "the headless job waited for the show job"
+    );
+    assert!(!s(&o.stderr).contains("queued behind"), "{}", s(&o.stderr));
+    // a second show job waits for the first
+    let o = d.run(&["run", "--show", "--", "true"], t.path());
+    assert!(o.status.success(), "{}", s(&o.stderr));
+    assert!(s(&o.stderr).contains("queued behind 1"), "{}", s(&o.stderr));
+    let o = show.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", s(&o.stderr));
+}
+
+#[test]
+fn show_without_a_desktop_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let d = Daemon::start();
+    let o = d.run(&["run", "--show", "--", "true"], t.path());
+    assert_eq!(o.status.code(), Some(125));
+    assert!(s(&o.stderr).contains("no desktop session"), "{}", s(&o.stderr));
+    // set, but nothing listens there
+    let d = Daemon::start_with(Some(&t.path().join("wayland-gone")));
+    let o = d.run(&["run", "--show", "--", "true"], t.path());
+    assert_eq!(o.status.code(), Some(125));
+    assert!(
+        s(&o.stderr).contains("--show: connecting to the desktop"),
+        "{}",
+        s(&o.stderr)
+    );
+    assert_eq!(d.job_dirs(), 0);
+}
+
+#[test]
+fn show_takes_no_screenshot_and_needs_the_display() {
+    let t = tempfile::tempdir().unwrap();
+    let d = Daemon::start();
+    for args in [
+        ["--show", "--screenshot", "2"].as_slice(),
+        &["--show", "--no-display"],
+    ] {
+        let mut a = vec!["run"];
+        a.extend(args);
+        a.extend(["--", "true"]);
+        let o = d.run(&a, t.path());
+        assert_eq!(
+            o.status.code(),
+            Some(2),
+            "clap refuses {args:?}: {}",
+            s(&o.stderr)
+        );
+    }
 }

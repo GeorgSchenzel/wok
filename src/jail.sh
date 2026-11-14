@@ -13,6 +13,10 @@
 # The daemon runs it with a cleared environment plus:
 #   WOK_BWRAP        bwrap to use (else from PATH)
 #   WOK_DISPLAY=1    start a headless compositor for the job
+#   WOK_DISPLAY=show the job's windows go to the desktop, through
+#                    WOK_SHOW_SOCKET: a listener the daemon made on the
+#                    desktop's compositor for this job (security context),
+#                    bound as the job's only Wayland socket
 #   WOK_SCREENSHOT=s with WOK_DISPLAY: run the job in the background, grim
 #                    $WOK_OUT/screenshot.png after s seconds, then stop the job
 #   WOK_JAIL_PATH    dirs put first on the job's PATH (the package's sway, grim)
@@ -33,6 +37,9 @@
 #     (WLR_BACKENDS=headless, gles2, a generated config, XWayland disabled, so
 #     it can't race the session for :0). So: no X11 in jobs, and the headless
 #     seat has no input devices (mesa-demos' eglut tools crash on that).
+#     --show: the desktop's compositor, but only through the job's own
+#     sandboxed listener (never the session's socket, which stays invisible
+#     with the rest of /run/user/<uid>); still no X11.
 #
 # Exit codes of its own: 250 the compositor didn't start; 251 the job exited
 # before its screenshot; 252 bad arguments.
@@ -47,6 +54,18 @@ for d in job out home; do
 done
 
 bwrap=${WOK_BWRAP:-$(command -v bwrap)} || { echo "wok jail: bwrap not found" >&2; exit 252; }
+
+show=()
+case ${WOK_DISPLAY:-0} in
+  0|1) ;;
+  show)
+    sock=${WOK_SHOW_SOCKET:-}
+    [ -S "$sock" ] && [ ! -L "$sock" ] || { echo "wok jail: WOK_SHOW_SOCKET is not a socket" >&2; exit 252; }
+    [ -z "${WOK_SCREENSHOT:-}" ] || { echo "wok jail: no screenshot with --show" >&2; exit 252; }
+    show=(--bind "$sock" /run/wok/wayland-0)
+    ;;
+  *) echo "wok jail: bad WOK_DISPLAY" >&2; exit 252 ;;
+esac
 user=$(id -un)
 
 # Runs inside the jail as `bash -c <this> wok-job <argv...>`: the job's argv
@@ -56,6 +75,11 @@ set -u
 shot=${WOK_SHOT:-}
 display=${WOK_DISPLAY:-0}
 unset WOK_SHOT WOK_DISPLAY
+if [ "$display" = show ]; then
+  chmod 700 "$XDG_RUNTIME_DIR" || exit 250
+  export WAYLAND_DISPLAY=wayland-0
+  exec "$@"
+fi
 if [ "$display" != 1 ]; then
   exec "$@"
 fi
@@ -131,6 +155,7 @@ exec "$bwrap" \
   --ro-bind-try /run/opengl-driver /run/opengl-driver \
   --ro-bind-try /run/opengl-driver-32 /run/opengl-driver-32 \
   --ro-bind-try /run/current-system /run/current-system \
+  "${show[@]}" \
   --tmpfs /tmp \
   --tmpfs /nix/var \
   "${sys_tmpfs[@]}" \
