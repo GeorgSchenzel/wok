@@ -6,27 +6,27 @@
 //! Two lanes: headless jobs, and `--show` jobs on the desktop's session. A
 //! show job is watched (or played) for as long as it takes, so it gets a lane
 //! of its own and never holds up the headless queue, nor waits for it.
+//!
+//! Nothing here is Linux-only: the jail, the display and socket activation
+//! are the backend's (`platform`, src/linux/ on Linux).
 
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context as _};
 
+use crate::linux as platform;
 use crate::proto::{self, ExitInfo, JobView, Limits, Links, Msg, RunReq};
 use crate::safefs::{self, Dir};
-use crate::wayland;
-
-const JAIL_SCRIPT: &str = include_str!("jail.sh");
 
 pub const MAX_TIMEOUT_S: u64 = 3600;
 /// Input limits per job (the job dir is on the host's disk).
@@ -42,11 +42,6 @@ const KILL_GRACE: Duration = Duration::from_secs(5);
 /// write that times out after sending part returns the part; the next one
 /// then fails, so a stalled client is noticed within two of these.)
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-/// A job is killed when the state dir's filesystem has less than this free
-/// (checked every DISK_CHECK). No per-job size cap: what a job writes is
-/// bounded by the disk, and the results by the client's caps.
-const MIN_FREE_BYTES: u64 = 1 << 30;
-const DISK_CHECK: Duration = Duration::from_secs(1);
 /// Names a job can't set: the jail and its compositor own them.
 const RESERVED_ENV: &[&str] = &["HOME", "PATH", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY"];
 
@@ -79,14 +74,9 @@ struct Shared {
     queue: Mutex<Queue>,
     turn: Condvar,
     state: PathBuf,
-    jail: PathBuf,
+    jail: platform::Jail,
     connections: AtomicUsize,
     last_active: Mutex<Instant>,
-    /// Look the desktop up in the systemd user manager's environment
-    /// (`WOK_DESKTOP_ENV=systemd`, set by the unit), not the daemon's own.
-    desktop_from_systemd: bool,
-    /// MIN_FREE_BYTES, or more from $WOK_MIN_FREE (bytes; tests).
-    min_free: u64,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -106,21 +96,11 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     }
     fs::create_dir_all(&jobs)?;
 
-    let jail = match cfg.jail {
-        Some(p) => p,
-        None => {
-            let p = cfg.state.join("jail.sh");
-            let tmp = cfg.state.join("jail.sh.tmp");
-            fs::write(&tmp, JAIL_SCRIPT)?;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
-            fs::rename(&tmp, &p)?; // never edit a script that may be running
-            p
-        }
-    };
+    let jail = platform::Jail::new(&cfg.state, cfg.jail)?;
 
     let listener = match &cfg.socket {
         Some(path) => bind(path)?,
-        None => systemd_listener()?,
+        None => platform::activation_listener()?,
     };
 
     let shared = Arc::new(Shared {
@@ -130,15 +110,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         jail,
         connections: AtomicUsize::new(0),
         last_active: Mutex::new(Instant::now()),
-        desktop_from_systemd: std::env::var_os("WOK_DESKTOP_ENV").is_some_and(|v| v == "systemd"),
-        min_free: std::env::var("WOK_MIN_FREE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .map_or(MIN_FREE_BYTES, |v: u64| v.max(MIN_FREE_BYTES)),
     });
-    if find_scope().is_none() {
-        eprintln!("wok: WARNING: {NO_SCOPE}");
-    }
 
     if let Some(idle) = cfg.idle_exit {
         let s = shared.clone();
@@ -202,23 +174,6 @@ fn bind(path: &Path) -> anyhow::Result<UnixListener> {
     Ok(l)
 }
 
-/// The socket systemd's `wok.socket` passes as fd 3.
-fn systemd_listener() -> anyhow::Result<UnixListener> {
-    let pid_ok = std::env::var("LISTEN_PID")
-        .ok()
-        .and_then(|p| p.parse::<u32>().ok())
-        == Some(std::process::id());
-    let fds = std::env::var("LISTEN_FDS")
-        .ok()
-        .and_then(|n| n.parse::<i32>().ok());
-    if !pid_ok || fds != Some(1) {
-        bail!("no socket from systemd (LISTEN_FDS); run with --socket <path> in the foreground");
-    }
-    let fd: RawFd = 3;
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    Ok(unsafe { UnixListener::from_raw_fd(fd) })
-}
-
 fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
     conn.set_read_timeout(Some(UPLOAD_READ_TIMEOUT))?;
     let mut r = io::BufReader::new(conn.try_clone()?);
@@ -255,17 +210,9 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
         drain_upload(&mut r);
         return refuse(&mut w, &format!("{e:#}"));
     }
-    if req.show && wayland::desktop_socket(s.desktop_from_systemd).is_none() {
+    if let Some(why) = req.show.then(|| s.jail.desktop_missing()).flatten() {
         drain_upload(&mut r);
-        let from = if s.desktop_from_systemd {
-            "the systemd user manager's environment"
-        } else {
-            "the daemon's environment"
-        };
-        return refuse(
-            &mut w,
-            &format!("--show: this wok daemon found no desktop session (WAYLAND_DISPLAY, with XDG_RUNTIME_DIR, not found in {from})"),
-        );
+        return refuse(&mut w, &format!("--show: {why}"));
     }
 
     let (id, job) = JobDir::new_job(&s.state.join("jobs"))?;
@@ -289,13 +236,9 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
         eprintln!("wok: job {id}: the client left while queued");
         return Ok(());
     };
-    // the job's own listener on the desktop, made at its turn (the desktop
-    // looked up again: sway may have restarted), gone with it
+    // the job's way onto the desktop, made at its turn, gone with the job
     let show = if req.show {
-        let listened = wayland::desktop_socket(s.desktop_from_systemd)
-            .ok_or_else(|| anyhow::anyhow!("no desktop session (no WAYLAND_DISPLAY)"))
-            .and_then(|d| wayland::listen(&d, &job.root.join("wayland-0"), &id));
-        match listened {
+        match s.jail.show(&job.root, &id) {
             Ok(sh) => Some(sh),
             Err(e) => {
                 drop(job); // gone before the client hears of it
@@ -315,13 +258,6 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
         };
         proto::send_stderr(&mut w, note.as_bytes())?;
     }
-    // probed for each job: a user manager that wasn't ready at the daemon's
-    // start doesn't leave every later job uncapped
-    let scope = find_scope();
-    if scope.is_none() {
-        eprintln!("wok: job {id}: WARNING: {NO_SCOPE}");
-        proto::send_stderr(&mut w, format!("wok: WARNING: {NO_SCOPE}\n").as_bytes())?;
-    }
     eprintln!(
         "wok: job {id} started{}: {:?}",
         if show.is_some() { " on the desktop" } else { "" },
@@ -330,16 +266,11 @@ fn handle(s: &Shared, conn: UnixStream) -> anyhow::Result<()> {
     proto::send(&mut w, &Msg::Started { id: id.clone() })?;
     w.flush()?;
 
-    let (exit, client_gone) = run_job(s, scope.as_deref(), &job.root, &req, &mut w, &conn)?;
+    let (exit, client_gone) = run_job(s, &job.root, &req, &mut w, &conn)?;
     // the compositor stops accepting for this job; the next job may start
     // while the results go out
     drop(show);
     drop(turn);
-    // a job may leave dirs it made unreadable (chmod 000): ours to send
-    // (send_tree goes 64 deep below out/)
-    if let Ok(root) = Dir::open(&job.root) {
-        safefs::own_tree(&root, 66);
-    }
     eprintln!(
         "wok: job {id} done: {exit:?}{}",
         if client_gone { ", the client left" } else { "" }
@@ -381,37 +312,6 @@ fn drain_upload(r: &mut impl Read) {
             return;
         }
     }
-}
-
-const NO_SCOPE: &str =
-    "no systemd user scope (systemd-run --user --scope): this job runs without memory and task caps";
-
-/// systemd-run, if a user scope can be made with it ($WOK_SCOPE overrides:
-/// a path, or empty for none).
-fn find_scope() -> Option<PathBuf> {
-    let p = match std::env::var_os("WOK_SCOPE") {
-        Some(v) if v.is_empty() => return None,
-        Some(v) => PathBuf::from(v),
-        None => std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|d| d.join("systemd-run"))
-                .find(|p| p.is_file())
-        })?,
-    };
-    let ok = Command::new(&p)
-        .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    ok.then_some(p)
-}
-
-fn free_bytes(p: &Path) -> Option<u64> {
-    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
 }
 
 fn refuse(w: &mut impl Write, msg: &str) -> anyhow::Result<()> {
@@ -607,74 +507,16 @@ fn client_left(fd: RawFd) -> Option<&'static str> {
     }
 }
 
-fn spawn_jail(s: &Shared, scope: Option<&Path>, root: &Path, req: &RunReq) -> io::Result<Child> {
-    let mut cmd = Command::new("bash");
-    cmd.arg(&s.jail).arg(root).arg("--").args(&req.argv);
-    cmd.env_clear();
-    if let Some(scope) = scope {
-        cmd.env("WOK_SCOPE", scope);
-    }
-    // XDG_RUNTIME_DIR and the bus are for systemd-run (the jail clears them)
-    for k in [
-        "PATH",
-        "WOK_BWRAP",
-        "WOK_JAIL_PATH",
-        "WOK_MEMORY_MAX",
-        "WOK_TASKS_MAX",
-        "XDG_RUNTIME_DIR",
-        "DBUS_SESSION_BUS_ADDRESS",
-    ] {
-        if let Some(v) = std::env::var_os(k) {
-            cmd.env(k, v);
-        }
-    }
-    let display = match (req.display, req.show) {
-        (_, true) => "show",
-        (true, false) => "1",
-        (false, false) => "0",
-    };
-    cmd.env("WOK_DISPLAY", display);
-    if req.show {
-        cmd.env("WOK_SHOW_SOCKET", root.join("wayland-0"));
-    }
-    if let Some(shot) = req.screenshot_s {
-        cmd.env("WOK_SCREENSHOT", format!("{shot}"));
-    }
-    for (k, v) in &req.env {
-        cmd.env(format!("WOK_JOBENV_{k}"), v);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd.process_group(0);
-    let daemon = std::process::id() as libc::pid_t;
-    unsafe {
-        cmd.pre_exec(move || {
-            // the job dies with this thread's process; bwrap's
-            // --die-with-parent takes the jail's pid namespace with it
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::getppid() != daemon {
-                libc::_exit(126);
-            }
-            Ok(())
-        });
-    }
-    cmd.spawn()
-}
-
 /// Run the job, streaming its output, until it exits. Returns how it ended
 /// and whether the client went away (the job is killed then).
 fn run_job(
     s: &Shared,
-    scope: Option<&Path>,
     root: &Path,
     req: &RunReq,
     w: &mut impl Write,
     conn: &UnixStream,
 ) -> anyhow::Result<(ExitInfo, bool)> {
-    let mut child = match spawn_jail(s, scope, root, req) {
+    let mut child = match s.jail.spawn(root, req) {
         Ok(c) => c,
         Err(e) => bail!("starting the jail: {e}"),
     };
@@ -687,17 +529,15 @@ fn run_job(
     let mut timed_out = false;
     let mut client_gone = false;
     let mut exited_at: Option<Instant> = None;
-    let mut stopped: Option<String> = None;
-    let mut next_disk_check = Instant::now() + DISK_CHECK;
     let mut buf = vec![0u8; 64 * 1024];
 
-    // TERM goes to the jail script, which passes it to the jail's pid 1 and
-    // so to every process in the jail; KILL takes the script and the jail
+    // the backend's contract: TERM to the group lets every process of the
+    // job stop, KILL ends them all
     let signal = |sig| unsafe { libc::kill(-pgid, sig) };
     loop {
         let mut fds = vec![libc::pollfd {
             fd: conn.as_raw_fd(),
-            events: libc::POLLIN | libc::POLLRDHUP,
+            events: libc::POLLIN,
             revents: 0,
         }];
         for p in [&out, &err].into_iter().flatten() {
@@ -746,20 +586,6 @@ fn run_job(
         if exited_at.is_none() && child.try_wait()?.is_some() {
             exited_at = Some(now);
         }
-        // the disk: a KILL at once (a TERM's grace is more writes), and
-        // checked through the grace of any other stop too; not once the jail
-        // has exited (a job that ended on its own keeps its exit status)
-        if stopped.is_none() && exited_at.is_none() && now >= next_disk_check {
-            next_disk_check = now + DISK_CHECK;
-            if free_bytes(root).is_some_and(|f| f < s.min_free) {
-                stopped = Some(format!(
-                    "the host's disk is nearly full (under {} MiB free)",
-                    s.min_free >> 20
-                ));
-                signal(libc::SIGKILL);
-                killed_at.get_or_insert(now);
-            }
-        }
         if killed_at.is_none() && now >= deadline {
             timed_out = true;
             signal(libc::SIGTERM);
@@ -780,7 +606,6 @@ fn run_job(
         code: status.code(),
         signal: status.signal(),
         timed_out,
-        stopped,
     };
     Ok((exit, client_gone))
 }

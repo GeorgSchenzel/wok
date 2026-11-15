@@ -16,7 +16,7 @@ wok status
 
 - The job is argv, run in a copy of `--in` (`~/job`, in a scratch home
   `/home/wok`); `$WOK_OUT` is `~/out`. No network, no host home, no host env,
-  no tty; only its own dirs are writable. Details: `src/jail.sh`.
+  no tty; only its own dirs are writable. Details: `src/linux/jail.sh`.
 - `--screenshot S`: the job runs in the background, `grim` takes
   `$WOK_OUT/screenshot.png` after S seconds, then the job is stopped.
 - `--show`: the job's windows go to the desktop's sway session instead of a
@@ -27,30 +27,24 @@ wok status
   the job's id; sway criteria `[sandbox_engine="wok"]` match its windows), so
   sway hides its privileged protocols from it: no screencopy, background
   clipboard access (data control), virtual keyboard or pointer, layer shell,
-  toplevel lists; the daemon checks that through the job's listener and
-  refuses otherwise. **Not hidden (accepted):** like any window, while it has
+  toplevel lists. **Not hidden (accepted):** like any window, while it has
   keyboard focus the job gets the keys typed into it and can read and replace
   the clipboard and primary selection (copy a command elsewhere, and a focused
   job may swap it before you paste); sway focuses new windows by default. The session's
   own socket stays invisible; still no X11, no sound. No `--screenshot` with
   it. Needs sway 1.9+ and `WAYLAND_DISPLAY` (under systemd, read from the user
   manager's environment for each job).
-- Limits: each job runs in a transient systemd user scope (memory 8G, 1024
-  tasks by default; tmpfs counts as memory; without a scope the job runs
-  uncapped and says so on stderr). Disk: no per-job cap. The job's dirs are
-  on the state dir's disk, and the job is killed when that disk has under
-  1 GiB free (checked each second, so one big `fallocate` can fill it for a
-  moment, until the job's dir is removed). Results over 8 GiB or 200k entries
-  fail on the client with that reason (what arrived before stays). A client
-  that stops reading for ~10–20 s loses its job.
+- Limits: the timeout; no memory, task or disk caps (a simple tool for a
+  local box). Results over 8 GiB or 200k entries fail on the client with
+  that reason (what arrived before stays). A client that stops reading for
+  ~10–20 s loses its job.
 - The jail's filesystem is an allowlist: /nix/store, /etc, /usr, /bin,
   /lib64, /sys read-only (host mounts inside /etc and /sys masked), the GPU's
   render and NVIDIA nodes, private tmpfs elsewhere. Nothing else of the host.
-- Results never include links or special files a job made (named on stderr).
+- Results never include links or special files a job made, nor what it
+  left unreadable (each named on stderr).
 - Exit status: the job's; 124 timed out (`--timeout`, default 600, max 3600;
-  the job gets a TERM, then a KILL 5 s later); 125 also when wok stopped it
-  (the reason on stderr);
-  69 no daemon; 125 wok's own errors. A client that goes away takes its job
+  the job gets a TERM, then a KILL 5 s later); 69 no daemon; 125 wok's own errors. A client that goes away takes its job
   with it.
 - The socket: `$WOK_SOCKET`, else `/run/bento/wok.sock` (bento's `wok`
   channel, in a box), else `~/.local/share/wok/wok.sock` (the daemon's).
@@ -61,7 +55,8 @@ wok status
 `services.wok.enable = true;` gives `wok.socket` and `wok.service`) and exits
 after 10 idle minutes. In the foreground: `wok daemon --socket <path>`. State
 (job dirs, a lock) is in `~/.local/state/wok/`; job dirs are removed after each
-job and at start.
+job and at start. The daemon is Linux-only for now (its jail, display and
+activation are `src/linux/`); the client builds anywhere.
 
 ## Protocol
 
@@ -77,7 +72,7 @@ chunks, stdout/stderr chunks. No message relies on a half-close or on EOF. See
 - `just gpu-test`: the display, the GPU, a screenshot, and that the desktop
   session is untouched (on the GPU machine).
 - `just show-test`: `--show` against a private headless sway (pixman, no
-  GPU), never the desktop's: privileged globals hidden, the window tagged,
+  GPU), never the desktop's: no screencopy for the job, the window tagged,
   the lanes.
 - `just show-desktop`: `--show` on the real session; opens vkcube there for
   15 s (run it from a terminal in the session).

@@ -1,11 +1,14 @@
 mod client;
+// the daemon needs a backend for its host's jail and display; Linux's is
+// src/linux/ (the client builds anywhere)
+#[cfg(target_os = "linux")]
 mod daemon;
+#[cfg(target_os = "linux")]
+mod linux;
 mod proto;
 mod safefs;
-mod wayland;
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -118,29 +121,43 @@ fn main() {
             state,
             idle_exit,
             jail,
-        } => {
-            let idle_exit = match (idle_exit, &socket) {
-                (Some(0), _) => None,
-                (Some(s), _) => Some(Duration::from_secs(s)),
-                (None, None) => Some(Duration::from_secs(600)),
-                (None, Some(_)) => None,
-            };
-            let res = daemon::default_state().and_then(|default| {
-                daemon::run(daemon::Config {
-                    socket,
-                    state: state.unwrap_or(default),
-                    jail,
-                    idle_exit,
-                })
-            });
-            match res {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("wok daemon: {e:#}");
-                    1
-                }
-            }
-        }
+        } => daemon_main(socket, state, idle_exit, jail),
     };
     std::process::exit(code);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemon_main(_: Option<PathBuf>, _: Option<PathBuf>, _: Option<u64>, _: Option<PathBuf>) -> i32 {
+    eprintln!("wok daemon: not built for this OS (only the client is)");
+    1
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_main(
+    socket: Option<PathBuf>,
+    state: Option<PathBuf>,
+    idle_exit: Option<u64>,
+    jail: Option<PathBuf>,
+) -> i32 {
+    let idle_exit = match (idle_exit, &socket) {
+        (Some(0), _) => None,
+        (Some(s), _) => Some(std::time::Duration::from_secs(s)),
+        (None, None) => Some(std::time::Duration::from_secs(600)),
+        (None, Some(_)) => None,
+    };
+    let res = daemon::default_state().and_then(|default| {
+        daemon::run(daemon::Config {
+            socket,
+            state: state.unwrap_or(default),
+            jail,
+            idle_exit,
+        })
+    });
+    match res {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("wok daemon: {e:#}");
+            1
+        }
+    }
 }

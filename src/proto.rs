@@ -53,9 +53,6 @@ pub struct ExitInfo {
     pub code: Option<i32>,
     pub signal: Option<i32>,
     pub timed_out: bool,
-    /// Why wok stopped the job, when it did for a reason other than time.
-    #[serde(default)]
-    pub stopped: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -232,13 +229,22 @@ fn send_dir(
         let path = format!("{prefix}{utf8}");
         match dir.kind(&name)? {
             Kind::Dir if depth >= 63 => skip("too deep")?,
-            Kind::Dir => {
-                send(w, &Msg::Dir { path: path.clone() })?;
-                let sub = dir.open_dir(&name).with_context(|| format!("opening {path}"))?;
-                send_dir(w, &sub, &format!("{path}/"), links, depth + 1, skipped)?;
-            }
+            // unreadable (a job may chmod 000 what it made): left out, named
+            Kind::Dir => match dir.open_dir(&name) {
+                Err(e) => skip(&format!("unreadable dir ({e})"))?,
+                Ok(sub) => {
+                    send(w, &Msg::Dir { path: path.clone() })?;
+                    send_dir(w, &sub, &format!("{path}/"), links, depth + 1, skipped)?;
+                }
+            },
             Kind::File { .. } => {
-                let mut f = dir.open_file(&name).with_context(|| format!("opening {path}"))?;
+                let mut f = match dir.open_file(&name) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        skip(&format!("unreadable file ({e})"))?;
+                        continue;
+                    }
+                };
                 let meta = f.metadata()?;
                 let size = meta.len();
                 let exec = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o100 != 0;

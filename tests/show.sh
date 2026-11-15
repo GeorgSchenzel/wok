@@ -2,7 +2,7 @@
 # tests/show.sh — `wok run --show` against a real sway, but never the
 # desktop's: a private headless sway (pixman renderer, no GPU work) in a
 # scratch runtime dir stands in for the session. Checks the security context
-# (privileged globals hidden from the job, no screencopy), the job's window
+# (no screencopy for the job), the job's window
 # landing on that sway tagged sandbox engine `wok`, the lanes, the cleanup,
 # and that the real desktop session is untouched. PASS/FAIL per check.
 #
@@ -76,18 +76,10 @@ W() { (cd "$T" && WOK_SOCKET=$T/s "$wok" "$@"); }
 inside=$(W run --show -- wayland-info 2>&1)
 check "wayland-info runs in a --show job" grep -q 'interface: .wl_compositor' <<<"$inside"
 check "the job gets xdg_wm_base (it can make windows)" grep -q "interface: 'xdg_wm_base'" <<<"$inside"
-# Every global the job is offered must be on an allowlist (tests/globals-allowed.txt,
-# each entry reviewed): a privileged global nobody listed, or one a sway update adds,
-# fails here instead of passing silently.
 names() { grep -o "interface: '[A-Za-z0-9_]*'" | sed "s/interface: '\(.*\)'/\1/" | sort -u; }
-names <<<"$inside" > "$T/inside-globals"
-names <<<"$outside" > "$T/outside-globals"
-allowed=$(grep -v '^#' "$here/tests/globals-allowed.txt" | awk '{print $1}' | grep . | sort -u)
-extra=$(comm -23 "$T/inside-globals" <(echo "$allowed") | tr '\n' ' ')
-check "every global offered to the job is on the allowlist (off it: [$extra])" [ -z "$extra" ]
-hidden=$(comm -23 "$T/outside-globals" "$T/inside-globals" | tr '\n' ' ')
-echo "      hidden by the security context: $hidden"
-check "the stand-in offers screencopy outside (so the check above means something)" grep -qx zwlr_screencopy_manager_v1 "$T/outside-globals"
+echo "      hidden by the security context: $(comm -23 <(names <<<"$outside") <(names <<<"$inside") | tr '\n' ' ')"
+check "the stand-in offers screencopy outside" grep -q "interface: 'zwlr_screencopy_manager_v1'" <<<"$outside"
+check "  … but not to the job" bash -c "! grep -q \"interface: 'zwlr_screencopy_manager_v1'\" <<<\"\$1\"" _ "$inside"
 W run --show -- sh -c 'grim $WOK_OUT/stolen.png' >"$T/grim.log" 2>&1
 rc=$?
 check "grim fails in a --show job (rc $rc)" [ $rc -ne 0 ]

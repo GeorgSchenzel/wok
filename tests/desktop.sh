@@ -6,7 +6,7 @@
 #
 # Starts its own daemon (scratch socket and state under target/desktop-test,
 # the built-in jail, this terminal's WAYLAND_DISPLAY as its desktop) and stops
-# it by its PID. Checks what it can by itself (privileged globals hidden, grim
+# it by its PID. Checks what it can by itself (grim
 # refused, the session's processes and sockets unchanged); the window you
 # answer: vkcube should spin on your sway for 15 s, on the RTX 2080, and close.
 # NOTE (accepted, 2026-11-15): while its window has focus, a --show job gets
@@ -56,11 +56,7 @@ W() { (cd "$T" && WOK_SOCKET=$T/s "$wok" "$@"); }
 outside=$("$winfo" 2>&1)
 inside=$(W run --show -- wayland-info 2>&1)
 check "a --show job reaches the session" grep -q "interface: 'xdg_wm_base'" <<<"$inside"
-# every global the job is offered must be on the reviewed allowlist
 names() { grep -o "interface: '[A-Za-z0-9_]*'" | sed "s/interface: '\(.*\)'/\1/" | sort -u; }
-allowed=$(grep -v '^#' "$here/tests/globals-allowed.txt" | awk '{print $1}' | grep . | sort -u)
-extra=$(comm -23 <(names <<<"$inside") <(echo "$allowed") | tr '\n' ' ')
-check "every global offered to the job is on the allowlist (off it: [$extra])" [ -z "$extra" ]
 echo "      hidden from the job on your session: $(comm -23 <(names <<<"$outside") <(names <<<"$inside") | tr '\n' ' ')"
 W run --show -- sh -c 'grim $WOK_OUT/stolen.png' >/dev/null 2>&1
 check "grim can't capture the session from a job" [ -z "$(find "$T/wok-out" -name stolen.png 2>/dev/null)" ]

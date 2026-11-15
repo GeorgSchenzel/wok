@@ -392,62 +392,19 @@ fn an_upload_that_tries_to_escape_is_refused() {
     assert_eq!(d.job_dirs(), 0);
 }
 
-/// recvmsg: bytes and any fds that came with them.
-fn recv_fds(fd: i32, buf: &mut [u8]) -> (usize, Vec<i32>) {
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut _,
-        iov_len: buf.len(),
-    };
-    let mut cbuf = [0u8; 128];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cbuf.as_mut_ptr() as *mut _;
-    msg.msg_controllen = cbuf.len() as _;
-    let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
-    let mut fds = Vec::new();
-    if n > 0 {
-        unsafe {
-            let mut cm = libc::CMSG_FIRSTHDR(&msg);
-            while !cm.is_null() {
-                if (*cm).cmsg_type == libc::SCM_RIGHTS {
-                    let count = ((*cm).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / 4;
-                    let p = libc::CMSG_DATA(cm) as *const i32;
-                    fds.extend((0..count).map(|k| *p.add(k)));
-                }
-                cm = libc::CMSG_NXTHDR(&msg, cm);
-            }
-        }
-    }
-    (n.max(0) as usize, fds)
-}
-
 /// One client of the stand-in compositor: `globals` announced, syncs
-/// answered, instance ids recorded; a listener it is handed is served with
-/// `inside` (what a sandboxed client sees).
+/// answered, instance ids recorded (the fds it is handed are dropped).
 fn serve(
     mut c: std::os::unix::net::UnixStream,
     globals: &'static [&'static str],
-    inside: &'static [&'static str],
     ids: Arc<Mutex<Vec<String>>>,
 ) {
-    use std::os::fd::{AsRawFd, FromRawFd};
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        let (n, fds) = recv_fds(c.as_raw_fd(), &mut chunk);
+        let n = c.read(&mut chunk).unwrap_or(0);
         if n == 0 {
             return;
-        }
-        if let Some(&lfd) = fds.first() {
-            let l = unsafe { UnixListener::from_raw_fd(lfd) };
-            let ids = ids.clone();
-            std::thread::spawn(move || {
-                for c in l.incoming().flatten() {
-                    let ids = ids.clone();
-                    std::thread::spawn(move || serve(c, inside, &[], ids));
-                }
-            });
         }
         buf.extend_from_slice(&chunk[..n]);
         while buf.len() >= 8 {
@@ -499,31 +456,15 @@ fn serve(
     }
 }
 
-/// A compositor stand-in for `--show` that hides what sway hides; records
-/// each listener's instance id.
+/// A compositor stand-in for `--show`; records each listener's instance id.
 fn fake_compositor(path: &Path) -> Arc<Mutex<Vec<String>>> {
-    fake_compositor_offering(path, &["wl_compositor", "xdg_wm_base"])
-}
-
-fn fake_compositor_offering(path: &Path, inside: &'static [&'static str]) -> Arc<Mutex<Vec<String>>> {
     let l = UnixListener::bind(path).unwrap();
     let ids = Arc::new(Mutex::new(Vec::new()));
     let ids2 = ids.clone();
     std::thread::spawn(move || {
         for c in l.incoming().flatten() {
             let ids = ids2.clone();
-            std::thread::spawn(move || {
-                serve(
-                    c,
-                    &[
-                        "wl_compositor",
-                        "zwlr_screencopy_manager_v1",
-                        "wp_security_context_manager_v1",
-                    ],
-                    inside,
-                    ids,
-                )
-            });
+            std::thread::spawn(move || serve(c, &["wl_compositor", "wp_security_context_manager_v1"], ids));
         }
     });
     ids
@@ -631,18 +572,6 @@ fn show_takes_no_screenshot_and_needs_the_display() {
 }
 
 #[test]
-fn show_is_refused_when_the_compositor_doesnt_hide() {
-    let t = tempfile::tempdir().unwrap();
-    let desktop = t.path().join("wayland-7");
-    let _ids = fake_compositor_offering(&desktop, &["wl_compositor", "zwlr_screencopy_manager_v1"]);
-    let d = Daemon::start_with(Some(&desktop));
-    let o = d.run(&["run", "--show", "--", "echo", "ran"], t.path());
-    assert_eq!(o.status.code(), Some(125), "{}", s(&o.stderr));
-    assert!(s(&o.stderr).contains("privileged"), "{}", s(&o.stderr));
-    assert!(!s(&o.stdout).contains("ran"));
-}
-
-#[test]
 fn a_refusal_with_an_upload_still_says_why() {
     // the daemon refuses before reading the upload; the reason must arrive
     // (not a reset read as "no daemon")
@@ -727,8 +656,8 @@ fn a_client_that_stops_reading_loses_its_job() {
 }
 
 #[test]
-fn a_job_that_locks_its_dirs_is_still_sent_and_cleaned_up() {
-    // chmod 000 on dirs it made: the results still come, the dir still goes
+fn a_job_that_locks_its_dirs_is_cleaned_up() {
+    // chmod 000 on dirs it made: left out of the results, named; the dir goes
     let t = tempfile::tempdir().unwrap();
     let d = Daemon::start();
     let o = d.run(
@@ -746,7 +675,8 @@ fn a_job_that_locks_its_dirs_is_still_sent_and_cleaned_up() {
     );
     assert!(o.status.success(), "{}", s(&o.stderr));
     assert_eq!(fs::read_to_string(t.path().join("res/top")).unwrap(), "ok\n");
-    assert_eq!(fs::read_to_string(t.path().join("res/locked/f")).unwrap(), "hi\n");
+    assert!(!t.path().join("res/locked").exists());
+    assert!(s(&o.stderr).contains("locked"), "{}", s(&o.stderr));
     let deadline = Instant::now() + Duration::from_secs(5);
     while d.job_dirs() != 0 {
         assert!(

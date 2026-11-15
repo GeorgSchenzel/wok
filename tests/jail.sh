@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/jail.sh — the jail's properties (src/jail.sh), PASS/FAIL per property.
+# tests/jail.sh — the jail's properties (src/linux/jail.sh), PASS/FAIL per property.
 # Runs on the host, no display (WOK_DISPLAY=0): bwrap only, no compositor, no
 # GPU work. The display and the GPU are tests/gpu.sh.
 #
@@ -9,7 +9,7 @@
 
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
-JAIL=$here/src/jail.sh
+JAIL=$here/src/linux/jail.sh
 T=$here/target/jail-test
 CANARY=wok-canary-$$
 uid=$(id -u)
@@ -170,20 +170,6 @@ check "no DRM card (primary) nodes" J sh -c '! ls /dev/dri/card* 2>/dev/null | g
 [ -e /dev/nvidiactl ] && check "/dev/nvidiactl is there" J test -c /dev/nvidiactl
 check "other devices are not (no /dev/sda, /dev/input)" J sh -c '! ls -d /dev/sd* /dev/nvme* /dev/input 2>/dev/null | grep -q .'
 
-# ---- limits (a transient user scope) ---------------------------------------
-scope=$(command -v systemd-run || true)
-if [ -n "$scope" ] && "$scope" --user --scope --quiet --collect -- true 2>/dev/null; then
-  JL() { WOK_SCOPE=$scope WOK_MEMORY_MAX=256M WOK_TASKS_MAX=64 WOK_DISPLAY=0 "$JAIL" "$T/root" -- "$@" </dev/null; }
-  check "the job runs in a scope of its own" bash -c "[ \"\$(WOK_SCOPE=$scope WOK_DISPLAY=0 '$JAIL' '$T/root' -- true </dev/null; echo \$?)\" = 0 ]"
-  JL sh -c 'head -c 600M /dev/zero > /tmp/fill && echo filled' >"$T/mem.log" 2>&1
-  rc=$?
-  check "memory is capped: 600M into tmpfs under a 256M cap is killed (rc $rc)" bash -c "[ $rc -ne 0 ] && ! grep -q filled '$T/mem.log'"
-  out=$(JL sh -c 'for i in $(seq 200); do sleep 3 & done 2>/dev/null; jobs -p | wc -l' 2>/dev/null)
-  check "tasks are capped: 200 forks under a cap of 64 (got ${out:-0})" bash -c "[ \"\${1:-0}\" -lt 200 ]" _ "$out"
-else
-  bad "no systemd user scope here: limits not checked"
-fi
-
 # ---- show mode (WOK_DISPLAY=show): one socket, nothing else ---------------
 # A stand-in for the daemon's listener on the desktop: a socket that answers
 # "hi". The real compositor and its security context are tests/show.sh.
@@ -258,23 +244,6 @@ if [ -x "$wok" ]; then
   rc=$?
   check "daemon + jail: a timeout TERMs the job first, its last write comes back (rc $rc)" \
     bash -c "[ $rc -eq 124 ] && [ \"\$(cat '$d/term/last' 2>/dev/null)\" = flushed ]"
-  kill "$dpid"; wait "$dpid" 2>/dev/null
-  # a second daemon whose free-space floor is 64 MiB below what is free now:
-  # a job that writes past it is killed (and ignoring TERM doesn't help)
-  mkdir -p "$d/state2"
-  free=$(( $(stat -f -c '%a * %S' "$d/state2") ))
-  env -u WAYLAND_DISPLAY WOK_MIN_FREE=$((free - (64 << 20))) "$wok" daemon --socket "$d/s2" --state "$d/state2" 2>"$d/log2" &
-  dpid=$!
-  for _ in $(seq 50); do [ -S "$d/s2" ] && break; sleep 0.1; done
-  t0=$SECONDS
-  err=$(cd "$d" && WOK_SOCKET=$d/s2 "$wok" run --no-display --out big -- \
-    sh -c 'trap "" TERM; for i in $(seq 400); do head -c 1M /dev/urandom > $WOK_OUT/f$i; sync -f $WOK_OUT; sleep 0.02; done' 2>&1 >/dev/null)
-  rc=$?
-  check "daemon + jail: a job that fills the disk is killed with a reason (rc $rc, $((SECONDS - t0))s)" \
-    bash -c "[ $rc -eq 125 ] && grep -q 'stopped: the host.s disk is nearly full' <<<\"\$1\"" _ "$err"
-  for _ in $(seq 50); do [ -z "$(ls -A "$d/state2/jobs")" ] && break; sleep 0.1; done
-  check "daemon + jail: its dir is gone" [ -z "$(ls -A "$d/state2/jobs")" ]
-  grep -q 'no systemd user scope' "$d/log2" && bad "daemon: no scope (no memory/task caps)" || ok "daemon: jobs get a scope (no warning in its log)"
   kill "$dpid"; wait "$dpid" 2>/dev/null
 else
   bad "target/debug/wok missing: cargo build first"

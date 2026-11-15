@@ -101,9 +101,7 @@ impl Dir {
     }
 
     pub fn kind(&self, name: &OsStr) -> io::Result<Kind> {
-        let c = cstr(name)?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        check(unsafe { libc::fstatat(self.0.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })?;
+        let st = self.lstat(name)?;
         Ok(match st.st_mode & libc::S_IFMT {
             libc::S_IFDIR => Kind::Dir,
             libc::S_IFREG => Kind::File {
@@ -111,12 +109,12 @@ impl Dir {
                 exec: st.st_mode & 0o100 != 0,
             },
             libc::S_IFLNK => {
+                let c = cstr(name)?;
                 let mut buf = vec![0u8; libc::PATH_MAX as usize];
-                let n = check(unsafe {
+                let n = unsafe {
                     libc::readlinkat(self.0.as_raw_fd(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
-                        as libc::c_int
-                })?;
-                buf.truncate(n as usize);
+                };
+                buf.truncate(check(n as libc::c_int)? as usize);
                 Kind::Link {
                     target: OsString::from_vec(buf),
                 }
@@ -150,10 +148,26 @@ impl Dir {
 
     /// The names in this dir, sorted, without following anything.
     pub fn names(&self) -> io::Result<Vec<OsString>> {
-        // /proc/self/fd/N resolves to this very dir, whatever its path is now
-        let mut names = std::fs::read_dir(format!("/proc/self/fd/{}", self.0.as_raw_fd()))?
-            .map(|e| e.map(|e| e.file_name()))
-            .collect::<io::Result<Vec<_>>>()?;
+        // a fresh fd for readdir: closedir closes it, and its offset is its own
+        let fd = check(unsafe { libc::openat(self.0.as_raw_fd(), c".".as_ptr(), DIR_FLAGS) })?;
+        let d = unsafe { libc::fdopendir(fd) };
+        if d.is_null() {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let mut names = Vec::new();
+        loop {
+            let e = unsafe { libc::readdir(d) };
+            if e.is_null() {
+                break;
+            }
+            let n = unsafe { std::ffi::CStr::from_ptr((*e).d_name.as_ptr()) }.to_bytes();
+            if n != b"." && n != b".." {
+                names.push(OsString::from_vec(n.to_vec()));
+            }
+        }
+        unsafe { libc::closedir(d) };
         names.sort();
         Ok(names)
     }
@@ -161,29 +175,6 @@ impl Dir {
 
 fn is_dir(st: &libc::stat) -> bool {
     st.st_mode & libc::S_IFMT == libc::S_IFDIR
-}
-
-/// After a job: make every dir under `dir` u+rwx and every file u+rw, down
-/// to `depth` levels (a job may leave chmod 000 dirs; ours to send and
-/// remove). Never follows links. Best effort.
-pub fn own_tree(dir: &Dir, depth: usize) {
-    let Ok(names) = dir.names() else { return };
-    for n in names {
-        let Ok(st) = dir.lstat(&n) else { continue };
-        let mode = st.st_mode & 0o7777;
-        if is_dir(&st) {
-            if mode & 0o700 != 0o700 {
-                let _ = dir.chmod(&n, mode | 0o700);
-            }
-            if depth > 0 {
-                if let Ok(sub) = dir.open_dir(&n) {
-                    own_tree(&sub, depth - 1);
-                }
-            }
-        } else if st.st_mode & libc::S_IFMT == libc::S_IFREG && mode & 0o600 != 0o600 {
-            let _ = dir.chmod(&n, mode | 0o600);
-        }
-    }
 }
 
 /// Remove `path` and everything under it, at any depth (past PATH_MAX too)
@@ -330,17 +321,6 @@ mod tests {
         assert!(!top.exists());
         assert!(outside.path().join("keep").exists(), "a link was followed");
         remove_all(&top).unwrap(); // gone already: fine
-    }
-
-    #[test]
-    fn own_tree_opens_locked_dirs() {
-        let t = tempfile::tempdir().unwrap();
-        let root = Dir::open(t.path()).unwrap();
-        let a = root.open_or_mkdir(OsStr::new("a")).unwrap();
-        a.create_file(OsStr::new("f"), 0o000).unwrap();
-        root.chmod(OsStr::new("a"), 0o000).unwrap();
-        own_tree(&root, 64);
-        assert!(std::fs::read(t.path().join("a/f")).is_ok());
     }
 
     #[test]

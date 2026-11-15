@@ -20,11 +20,6 @@
 #                    $WOK_OUT/screenshot.png after s seconds, then stop the job
 #   WOK_JAIL_PATH    dirs put first on the job's PATH (the package's sway, grim)
 #   WOK_JOBENV_<K>   the job's own env, as K
-#   WOK_SCOPE        systemd-run to put the job in a transient user scope
-#                    with WOK_MEMORY_MAX and WOK_TASKS_MAX (unset: no cgroup
-#                    limits; the daemon warns). XDG_RUNTIME_DIR and
-#                    DBUS_SESSION_BUS_ADDRESS are for systemd-run; the job
-#                    never sees them (--clearenv).
 #
 # Properties (tests/jail.sh):
 #   - the filesystem is an allowlist, not the host's / with holes: an empty
@@ -35,15 +30,12 @@
 #     Nothing else of the host exists in the jail: no home, no /persist, no
 #     /backups, no /var, no /nix/var (the nix daemon socket).
 #   - writable on disk: only the job's home with job/ and out/ (all in
-#     <job-root>, removed by the daemon after the job; the daemon stops a
-#     job when the disk gets nearly full); /tmp, /dev/shm, /run and /home are
-#     sized tmpfs (bwrap's /dev isn't; any tmpfs counts as the job's memory
-#     in its scope)
+#     <job-root>, removed by the daemon after the job); /tmp, /dev/shm, /run
+#     and /home are sized tmpfs (bwrap's /dev isn't)
 #   - no network: own netns, nothing up (AF_VSOCK isn't netns-scoped; there
 #     is no seccomp filter yet)
 #   - own user, pid, ipc, uts and cgroup namespaces; no nested user
 #     namespaces (--disable-userns)
-#   - memory and tasks capped by the scope (WOK_SCOPE)
 #   - no host environment (clearenv): API keys in the daemon's env don't leak
 #   - no controlling tty (--new-session; stdin is /dev/null)
 #   - GPU: the DRM render nodes (not the card nodes), the NVIDIA nodes,
@@ -197,20 +189,13 @@ for l in /run/opengl-driver /run/opengl-driver-32 /run/current-system; do
   [ -e "$l" ] && runs+=(--ro-bind "$l" "$l")
 done
 
-scope=()
-if [ -n "${WOK_SCOPE:-}" ]; then
-  scope=("$WOK_SCOPE" --user --scope --quiet --collect --expand-environment=no
-    -p "MemoryMax=${WOK_MEMORY_MAX:-8G}" -p MemorySwapMax=0
-    -p "TasksMax=${WOK_TASKS_MAX:-1024}" --)
-fi
-
 info=$root/.bwrap-info
 rm -f "$info"
 # bwrap in a process group of its own (job control): the daemon's TERM to our
 # group must reach the jail's pid 1 through us, not kill bwrap (whose
 # --die-with-parent would then KILL the jail at once)
 set -m
-"${scope[@]}" "$bwrap" \
+"$bwrap" \
   --unshare-user \
   --disable-userns \
   --unshare-net \

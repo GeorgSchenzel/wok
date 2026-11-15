@@ -202,10 +202,7 @@ fn run_inner(sock: &Path, opts: RunOpts) -> Result<i32, Failure> {
 
     receive_results(&mut r, opts.out, &id)?;
 
-    Ok(if let Some(why) = &exit.stopped {
-        eprintln!("wok: job {id} stopped: {why}");
-        EXIT_WOK
-    } else if exit.timed_out {
+    Ok(if exit.timed_out {
         eprintln!("wok: job {id} timed out after {}s", opts.req.timeout_s);
         EXIT_TIMEOUT
     } else if let Some(c) = exit.code {

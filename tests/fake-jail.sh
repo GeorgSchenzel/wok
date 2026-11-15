@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A stand-in for src/jail.sh in tests: the same arguments and env, no bwrap,
+# A stand-in for src/linux/jail.sh in tests: the same arguments and env, no bwrap,
 # no display, host paths. The jail itself is tests/jail.sh (on the host).
 set -eu
 root=$1

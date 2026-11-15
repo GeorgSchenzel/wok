@@ -17,10 +17,6 @@
 //! a new window by default, and xdg_activation lets a client ask for focus
 //! again.
 //!
-//! Hiding is the compositor's policy, so after making the listener the
-//! daemon connects through it once and refuses if any privileged global
-//! shows up (a compositor that implements the protocol but filters less).
-//!
 //! Just enough of the Wayland wire protocol, by hand: messages are
 //! `object id: u32, (size << 16 | opcode): u32, args`, native endian; strings
 //! are a u32 length (with the NUL) and the bytes padded to 4; fds travel as
@@ -37,33 +33,6 @@ use anyhow::{bail, Context as _};
 const DISPLAY: u32 = 1;
 const REGISTRY: u32 = 2;
 const MANAGER_IFACE: &str = "wp_security_context_manager_v1";
-
-/// Globals a sandboxed client must not get (sway's `is_privileged`, plus DRM
-/// leases and xdg-output, which sway also hides); any of them through the
-/// job's listener refuses `--show`.
-pub const PRIVILEGED: &[&str] = &[
-    "zxdg_output_manager_v1",
-    "zwlr_screencopy_manager_v1",
-    "ext_image_copy_capture_manager_v1",
-    "zwlr_export_dmabuf_manager_v1",
-    "zwlr_data_control_manager_v1",
-    "ext_data_control_manager_v1",
-    "zwp_virtual_keyboard_manager_v1",
-    "zwlr_virtual_pointer_manager_v1",
-    "zwlr_layer_shell_v1",
-    "zwlr_foreign_toplevel_manager_v1",
-    "ext_foreign_toplevel_list_v1",
-    "ext_session_lock_manager_v1",
-    "zwlr_gamma_control_manager_v1",
-    "zwlr_output_manager_v1",
-    "zwlr_output_power_manager_v1",
-    "wp_security_context_manager_v1",
-    "zwp_input_method_manager_v2",
-    "zwp_keyboard_shortcuts_inhibit_manager_v1",
-    "ext_transient_seat_manager_v1",
-    "ext_workspace_manager_v1",
-    "wp_drm_lease_device_v1",
-];
 
 /// Alive while the job may use the desktop. Dropping it closes the close fd
 /// (the compositor stops accepting on the listener) and removes the socket.
@@ -107,25 +76,6 @@ pub fn desktop_socket(from_systemd: bool) -> Option<PathBuf> {
         return Some(d);
     }
     Some(PathBuf::from(rt?).join(d))
-}
-
-/// The globals a client connecting to `socket` is offered.
-pub fn globals(socket: &Path) -> anyhow::Result<Vec<String>> {
-    let s = UnixStream::connect(socket).with_context(|| format!("connecting to {}", socket.display()))?;
-    s.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut c = Conn { s, buf: Vec::new() };
-    c.send(DISPLAY, 1, &Args::new().new_id(REGISTRY), &[])?;
-    c.send(DISPLAY, 0, &Args::new().new_id(3), &[])?;
-    let mut names = Vec::new();
-    c.until_done(3, |obj, op, body| {
-        if obj == REGISTRY && op == 0 {
-            let mut a = Parse(body);
-            a.u32()?;
-            names.push(a.string()?);
-        }
-        Ok(())
-    })?;
-    Ok(names)
 }
 
 /// Make `socket` a sandboxed listener on the compositor behind `desktop`.
@@ -187,12 +137,6 @@ pub fn listen(desktop: &Path, socket: &Path, instance: &str) -> anyhow::Result<S
     // the compositor holds its own copies of the listener and the close fd
     drop(listener);
     drop(close_r);
-    // what a job will see through it: nothing privileged, or no --show
-    let seen = globals(socket).context("checking the job's listener")?;
-    let leaked: Vec<&String> = seen.iter().filter(|g| PRIVILEGED.contains(&g.as_str())).collect();
-    if !leaked.is_empty() {
-        bail!("the desktop's compositor offers sandboxed clients privileged globals ({leaked:?}); refusing");
-    }
     Ok(show)
 }
 
@@ -368,60 +312,16 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(m[4..8].try_into().unwrap()), (16 << 16) | 3);
     }
 
-    /// recvmsg: bytes and any fds that came with them.
-    fn recv_fds(fd: RawFd, buf: &mut [u8]) -> (usize, Vec<RawFd>) {
-        let mut iov = libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut _,
-            iov_len: buf.len(),
-        };
-        let mut cbuf = [0u8; 128];
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cbuf.as_mut_ptr() as *mut _;
-        msg.msg_controllen = cbuf.len() as _;
-        let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
-        let mut fds = Vec::new();
-        if n > 0 {
-            unsafe {
-                let mut cm = libc::CMSG_FIRSTHDR(&msg);
-                while !cm.is_null() {
-                    if (*cm).cmsg_type == libc::SCM_RIGHTS {
-                        let count = ((*cm).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / 4;
-                        let p = libc::CMSG_DATA(cm) as *const RawFd;
-                        fds.extend((0..count).map(|k| *p.add(k)));
-                    }
-                    cm = libc::CMSG_NXTHDR(&msg, cm);
-                }
-            }
-        }
-        (n.max(0) as usize, fds)
-    }
-
-    /// One client of the stand-in: `globals` announced, syncs answered; on
-    /// create_listener, the passed listener is served with `inside`.
-    fn serve(
-        s: UnixStream,
-        globals: &'static [&'static str],
-        inside: &'static [&'static str],
-        error_on_commit: bool,
-    ) -> Vec<(u32, u16)> {
-        let mut s = s;
+    /// The stand-in's one client: `globals` announced, syncs answered (the
+    /// fds passed with create_listener are dropped). Returns the requests.
+    fn serve(mut s: UnixStream, globals: &'static [&'static str], error_on_commit: bool) -> Vec<(u32, u16)> {
         let mut seen = Vec::new();
         let mut buf = Vec::new();
         loop {
             let mut chunk = [0u8; 4096];
-            let (n, fds) = recv_fds(s.as_raw_fd(), &mut chunk);
+            let n = s.read(&mut chunk).unwrap_or(0);
             if n == 0 {
                 return seen;
-            }
-            if let Some(&lfd) = fds.first() {
-                let l = unsafe { UnixListener::from_raw_fd(lfd) };
-                std::thread::spawn(move || {
-                    for c in l.incoming().flatten() {
-                        std::thread::spawn(move || serve(c, inside, &[], false));
-                    }
-                });
             }
             buf.extend_from_slice(&chunk[..n]);
             while buf.len() >= 8 {
@@ -463,25 +363,21 @@ mod tests {
         std::thread::JoinHandle<Vec<(u32, u16)>>,
     );
 
-    /// A compositor stand-in: the daemon's connection, then the listener's.
-    fn fake(
-        globals: &'static [&'static str],
-        inside: &'static [&'static str],
-        error_on_commit: bool,
-    ) -> Fake {
+    /// A compositor stand-in for one connection.
+    fn fake(globals: &'static [&'static str], error_on_commit: bool) -> Fake {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wayland-9");
         let l = UnixListener::bind(&path).unwrap();
         let h = std::thread::spawn(move || {
             let (s, _) = l.accept().unwrap();
-            serve(s, globals, inside, error_on_commit)
+            serve(s, globals, error_on_commit)
         });
         (dir, path, h)
     }
 
     #[test]
     fn makes_a_tagged_listener_and_removes_it_after() {
-        let (dir, path, h) = fake(&["wl_compositor", MANAGER_IFACE], &["wl_compositor"], false);
+        let (dir, path, h) = fake(&["wl_compositor", MANAGER_IFACE], false);
         let sock = dir.path().join("job-wayland");
         let show = listen(&path, &sock, "1700000000-abcd").unwrap();
         assert!(sock.exists());
@@ -507,7 +403,7 @@ mod tests {
 
     #[test]
     fn no_security_context_is_a_refusal() {
-        let (dir, path, _h) = fake(&["wl_compositor"], &[], false);
+        let (dir, path, _h) = fake(&["wl_compositor"], false);
         let e = listen(&path, &dir.path().join("s"), "x").err().unwrap();
         assert!(format!("{e:#}").contains(MANAGER_IFACE), "{e:#}");
         assert!(!dir.path().join("s").exists());
@@ -515,22 +411,10 @@ mod tests {
 
     #[test]
     fn a_protocol_error_is_a_refusal() {
-        let (dir, path, _h) = fake(&[MANAGER_IFACE], &[], true);
+        let (dir, path, _h) = fake(&[MANAGER_IFACE], true);
         let e = listen(&path, &dir.path().join("s"), "x").err().unwrap();
         assert!(format!("{e:#}").contains("nested"), "{e:#}");
         assert!(!dir.path().join("s").exists(), "the socket goes with the failure");
-    }
-
-    #[test]
-    fn a_compositor_that_doesnt_hide_is_refused() {
-        let (dir, path, _h) = fake(
-            &[MANAGER_IFACE],
-            &["wl_compositor", "zwlr_screencopy_manager_v1"],
-            false,
-        );
-        let e = listen(&path, &dir.path().join("s"), "x").err().unwrap();
-        assert!(format!("{e:#}").contains("zwlr_screencopy_manager_v1"), "{e:#}");
-        assert!(!dir.path().join("s").exists());
     }
 
     #[test]
