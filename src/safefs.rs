@@ -125,6 +125,29 @@ impl Dir {
         })
     }
 
+    fn lstat(&self, name: &OsStr) -> io::Result<libc::stat> {
+        let c = cstr(name)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        check(unsafe { libc::fstatat(self.0.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })?;
+        Ok(st)
+    }
+
+    /// fchmodat follows a link in the last component, so this is only for
+    /// an entry just seen to be a dir or file, in a tree nothing else changes
+    /// (the job is gone).
+    fn chmod(&self, name: &OsStr, mode: u32) -> io::Result<()> {
+        let c = cstr(name)?;
+        check(unsafe { libc::fchmodat(self.0.as_raw_fd(), c.as_ptr(), mode as libc::mode_t, 0) })?;
+        Ok(())
+    }
+
+    fn unlink(&self, name: &OsStr, dir: bool) -> io::Result<()> {
+        let c = cstr(name)?;
+        let flags = if dir { libc::AT_REMOVEDIR } else { 0 };
+        check(unsafe { libc::unlinkat(self.0.as_raw_fd(), c.as_ptr(), flags) })?;
+        Ok(())
+    }
+
     /// The names in this dir, sorted, without following anything.
     pub fn names(&self) -> io::Result<Vec<OsString>> {
         // /proc/self/fd/N resolves to this very dir, whatever its path is now
@@ -133,6 +156,87 @@ impl Dir {
             .collect::<io::Result<Vec<_>>>()?;
         names.sort();
         Ok(names)
+    }
+}
+
+fn is_dir(st: &libc::stat) -> bool {
+    st.st_mode & libc::S_IFMT == libc::S_IFDIR
+}
+
+/// After a job: make every dir under `dir` u+rwx and every file u+rw, down
+/// to `depth` levels (a job may leave chmod 000 dirs; ours to send and
+/// remove). Never follows links. Best effort.
+pub fn own_tree(dir: &Dir, depth: usize) {
+    let Ok(names) = dir.names() else { return };
+    for n in names {
+        let Ok(st) = dir.lstat(&n) else { continue };
+        let mode = st.st_mode & 0o7777;
+        if is_dir(&st) {
+            if mode & 0o700 != 0o700 {
+                let _ = dir.chmod(&n, mode | 0o700);
+            }
+            if depth > 0 {
+                if let Ok(sub) = dir.open_dir(&n) {
+                    own_tree(&sub, depth - 1);
+                }
+            }
+        } else if st.st_mode & libc::S_IFMT == libc::S_IFREG && mode & 0o600 != 0o600 {
+            let _ = dir.chmod(&n, mode | 0o600);
+        }
+    }
+}
+
+/// Remove `path` and everything under it, at any depth (past PATH_MAX too)
+/// and whatever the modes, never following links. Walks with one open dir
+/// at a time (down by name, up by `..`), so a deep tree can't run it out of
+/// fds. Only for a tree nothing else changes (a finished job's).
+pub fn remove_all(path: &Path) -> io::Result<()> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidInput, "no parent");
+    let parent = path.parent().ok_or_else(bad)?;
+    let name = path.file_name().ok_or_else(bad)?;
+    let mut cur = Dir::open(if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    })?;
+    match cur.lstat(name) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(st) if !is_dir(&st) => return cur.unlink(name, false),
+        Ok(_) => {}
+    }
+    // (this dir's name in its parent, its subdirs still to remove)
+    let mut stack: Vec<(OsString, Vec<OsString>)> = Vec::new();
+    let mut down = Some(name.to_os_string());
+    loop {
+        if let Some(n) = down.take() {
+            let st = cur.lstat(&n)?;
+            if st.st_mode & 0o700 != 0o700 {
+                cur.chmod(&n, (st.st_mode & 0o7777) | 0o700)?;
+            }
+            cur = cur.open_dir(&n)?;
+            let mut subdirs = Vec::new();
+            for e in cur.names()? {
+                if is_dir(&cur.lstat(&e)?) {
+                    subdirs.push(e);
+                } else {
+                    cur.unlink(&e, false)?;
+                }
+            }
+            stack.push((n, subdirs));
+        }
+        let (n, pending) = stack.last_mut().expect("the stack holds the dir being removed");
+        if let Some(sub) = pending.pop() {
+            down = Some(sub);
+            continue;
+        }
+        let n = std::mem::take(n);
+        stack.pop();
+        cur = cur.open_dir(OsStr::new(".."))?;
+        cur.unlink(&n, true)?;
+        if stack.is_empty() {
+            return Ok(());
+        }
     }
 }
 
@@ -196,6 +300,47 @@ mod tests {
         assert!(root.open_file(OsStr::new("l")).is_err());
         assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
         assert!(matches!(root.kind(OsStr::new("l")).unwrap(), Kind::Link { .. }));
+    }
+
+    #[test]
+    fn remove_all_takes_deep_locked_trees() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let top = t.path().join("job");
+        std::fs::create_dir(&top).unwrap();
+        // past PATH_MAX, made relative to an fd
+        let mut d = Dir::open(&top).unwrap();
+        for _ in 0..1200 {
+            d = d.open_or_mkdir(OsStr::new("dddd")).unwrap();
+        }
+        d.create_file(OsStr::new("f"), 0o644).unwrap();
+        d.open_or_mkdir(OsStr::new("locked"))
+            .unwrap()
+            .create_file(OsStr::new("g"), 0o000)
+            .unwrap();
+        d.chmod(OsStr::new("locked"), 0o000).unwrap();
+        d.chmod(OsStr::new("."), 0o500).unwrap();
+        drop(d);
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), top.join("link")).unwrap();
+        std::fs::create_dir(top.join("ro")).unwrap();
+        std::fs::set_permissions(top.join("ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        remove_all(&top).unwrap();
+        assert!(!top.exists());
+        assert!(outside.path().join("keep").exists(), "a link was followed");
+        remove_all(&top).unwrap(); // gone already: fine
+    }
+
+    #[test]
+    fn own_tree_opens_locked_dirs() {
+        let t = tempfile::tempdir().unwrap();
+        let root = Dir::open(t.path()).unwrap();
+        let a = root.open_or_mkdir(OsStr::new("a")).unwrap();
+        a.create_file(OsStr::new("f"), 0o000).unwrap();
+        root.chmod(OsStr::new("a"), 0o000).unwrap();
+        own_tree(&root, 64);
+        assert!(std::fs::read(t.path().join("a/f")).is_ok());
     }
 
     #[test]

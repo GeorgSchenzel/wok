@@ -8,13 +8,14 @@
 //! can't capture the screen, list or inject into other windows, or watch the
 //! clipboard in the background. The job never sees the desktop's own socket.
 //!
-//! What it does NOT stop (R4): a job's window is an ordinary client. When it
-//! has keyboard focus it gets the keys typed into it and the current
-//! clipboard and primary selection (wl_data_device and primary selection stay
-//! available to sandboxed clients); sway focuses a new window by default, and
-//! xdg_activation lets a client ask for focus again. So a --show job can read
-//! what is typed or copied while its window is focused. See work-wok.md,
-//! "Plan changes proposed".
+//! What it does NOT stop, by Georg's decision (2026-11-15, work-wok.md): a
+//! job's window is an ordinary client. While it has keyboard focus it gets
+//! the keys typed into it, and it can read the current clipboard and primary
+//! selection and also replace them (wl_data_device and primary selection stay
+//! available to sandboxed clients; set_selection takes its focus serial): a
+//! command copied elsewhere can be swapped before it is pasted. Sway focuses
+//! a new window by default, and xdg_activation lets a client ask for focus
+//! again.
 //!
 //! Hiding is the compositor's policy, so after making the listener the
 //! daemon connects through it once and refuses if any privileged global
@@ -38,8 +39,10 @@ const REGISTRY: u32 = 2;
 const MANAGER_IFACE: &str = "wp_security_context_manager_v1";
 
 /// Globals a sandboxed client must not get (sway's `is_privileged`, plus DRM
-/// leases); any of them through the job's listener refuses `--show`.
+/// leases and xdg-output, which sway also hides); any of them through the
+/// job's listener refuses `--show`.
 pub const PRIVILEGED: &[&str] = &[
+    "zxdg_output_manager_v1",
     "zwlr_screencopy_manager_v1",
     "ext_image_copy_capture_manager_v1",
     "zwlr_export_dmabuf_manager_v1",

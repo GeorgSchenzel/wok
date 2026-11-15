@@ -85,10 +85,11 @@ badm=$(J sh -c '
     case $m in
       /|/bin|/dev|/dev/pts|/dev/shm|/etc|/home|/home/wok|/home/wok/job|/home/wok/out|/lib64|/nix/store|/proc|/run|/sys|/tmp|/usr) ;;
       /run/current-system|/run/opengl-driver|/run/opengl-driver-32|/run/wok/wayland-0) ;;
-      /dev/*) [ -c "$m" ] || echo "$m" ;;
+      /dev/null|/dev/zero|/dev/full|/dev/random|/dev/urandom|/dev/tty) ;; # bwrap --dev
+      /dev/dri/renderD*|/dev/nvidia0|/dev/nvidiactl|/dev/nvidia-modeset|/dev/nvidia-uvm|/dev/nvidia-uvm-tools) ;;
       /etc/*|/sys/*)
         if [ -d "$m" ]; then [ -z "$(ls -A "$m")" ] || echo "$m"
-        else [ "$(stat -c %t:%T "$m")" = 1:3 ] || echo "$m"; fi ;;
+        else [ -f "$m" ] && [ ! -s "$m" ] || echo "$m"; fi ;;
       *) echo "$m" ;;
     esac
   done')
@@ -96,9 +97,12 @@ check "every mount is on the allowlist or masked ($(wc -l <<<"$mounts") mounts; 
 # the host's own mounts inside /etc and /sys (persisted keys, efivars…) are masked
 host_sub=$(cut -d' ' -f5 /proc/self/mountinfo | grep -E '^/(etc|sys)/' | sort -u | head -20)
 if [ -n "$host_sub" ]; then
-  unmasked=$(J sh -c 'for m in "$@"; do if [ -d "$m" ]; then [ -z "$(ls -A "$m" 2>/dev/null)" ] || echo "$m"; elif [ -e "$m" ]; then [ "$(stat -c %t:%T "$m")" = 1:3 ] || echo "$m"; fi; done' _ $host_sub)
+  unmasked=$(J sh -c 'for m in "$@"; do if [ -d "$m" ]; then [ -z "$(ls -A "$m" 2>/dev/null)" ] || echo "$m"; elif [ -e "$m" ]; then [ -f "$m" ] && [ ! -s "$m" ] || echo "$m"; fi; done' _ $host_sub)
   check "the host's mounts in /etc and /sys are masked ($(wc -l <<<"$host_sub") of them)" [ -z "$unmasked" ]
 fi
+# a masked file reads as empty (an unreadable machine-id trips up D-Bus, SDL)
+[ -e /etc/machine-id ] && check "/etc/machine-id is readable (empty, if masked)" J cat /etc/machine-id
+check "masks are read-only" notJ sh -c 'for m in /sys/firmware/efi/efivars /sys/kernel/debug; do [ -d "$m" ] && : > "$m/x" && exit 0; done; exit 1'
 # a canary written on the host, outside the allowlist: nowhere in the jail's
 # writable or host-backed trees (the store, /proc and /sys aside)
 canary=wok-fs-canary-$$-$RANDOM
@@ -118,6 +122,14 @@ JS 'exec 3<>/dev/tcp/127.0.0.1/17760' 2>/dev/null; check "host loopback is unrea
 # ---- namespaces -------------------------------------------------------------
 check "no nested user namespaces" notJ unshare -U true
 check "own cgroup namespace" [ "$(J cat /proc/self/cgroup)" = "0::/" ]
+
+# ---- signals -----------------------------------------------------------------
+# a job starts with no signal ignored (a background job in a non-interactive
+# shell would get INT and QUIT ignored): Python's KeyboardInterrupt, kill -INT
+ign=$(J sh -c 'sed -n "s/^SigIgn:\t//p" /proc/self/status')
+check "the job starts with no signal ignored (SigIgn $ign)" [ "$((16#${ign:-1}))" -eq 0 ]
+J sh -c 'kill -INT $$; sleep 2'; rc=$?
+check "a SIGINT stops the job (rc $rc)" [ $rc -eq 130 ]
 
 # ---- processes and tty -----------------------------------------------------
 J kill -0 $$ 2>/dev/null; check "host processes are invisible (own pid ns)" [ $? -ne 0 ]
@@ -228,16 +240,19 @@ if [ -x "$wok" ]; then
   check "daemon + jail: a timeout TERMs the job first, its last write comes back (rc $rc)" \
     bash -c "[ $rc -eq 124 ] && [ \"\$(cat '$d/term/last' 2>/dev/null)\" = flushed ]"
   kill "$dpid"; wait "$dpid" 2>/dev/null
-  # a second daemon with a small disk cap: a job that writes past it is stopped
-  env -u WAYLAND_DISPLAY WOK_JOB_DISK_MAX=$((64 << 20)) "$wok" daemon --socket "$d/s2" --state "$d/state2" 2>"$d/log2" &
+  # a second daemon whose free-space floor is 64 MiB below what is free now:
+  # a job that writes past it is killed (and ignoring TERM doesn't help)
+  mkdir -p "$d/state2"
+  free=$(( $(stat -f -c '%a * %S' "$d/state2") ))
+  env -u WAYLAND_DISPLAY WOK_MIN_FREE=$((free - (64 << 20))) "$wok" daemon --socket "$d/s2" --state "$d/state2" 2>"$d/log2" &
   dpid=$!
   for _ in $(seq 50); do [ -S "$d/s2" ] && break; sleep 0.1; done
   t0=$SECONDS
   err=$(cd "$d" && WOK_SOCKET=$d/s2 "$wok" run --no-display --out big -- \
-    sh -c 'for i in $(seq 200); do head -c 1M /dev/zero > $WOK_OUT/f$i; sleep 0.02; done' 2>&1 >/dev/null)
+    sh -c 'trap "" TERM; for i in $(seq 400); do head -c 1M /dev/urandom > $WOK_OUT/f$i; sync -f $WOK_OUT; sleep 0.02; done' 2>&1 >/dev/null)
   rc=$?
-  check "daemon + jail: a job past its disk cap is stopped with a reason (rc $rc, $((SECONDS - t0))s)" \
-    bash -c "[ $rc -eq 125 ] && grep -q 'stopped: it wrote more than 64 MiB' <<<\"\$1\"" _ "$err"
+  check "daemon + jail: a job that fills the disk is killed with a reason (rc $rc, $((SECONDS - t0))s)" \
+    bash -c "[ $rc -eq 125 ] && grep -q 'stopped: the host.s disk is nearly full' <<<\"\$1\"" _ "$err"
   for _ in $(seq 50); do [ -z "$(ls -A "$d/state2/jobs")" ] && break; sleep 0.1; done
   check "daemon + jail: its dir is gone" [ -z "$(ls -A "$d/state2/jobs")" ]
   grep -q 'no systemd user scope' "$d/log2" && bad "daemon: no scope (no memory/task caps)" || ok "daemon: jobs get a scope (no warning in its log)"

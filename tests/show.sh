@@ -98,8 +98,8 @@ check "the job's display is wayland-0, no X11, no sway IPC ($(tr '\n' ' ' <<<"$e
 check "the session's own socket is invisible" bash -c "! (cd '$T' && WOK_SOCKET='$T/s' '$wok' run --show -- test -e '$wd')"
 check "the session's IPC socket is invisible" bash -c "! (cd '$T' && WOK_SOCKET='$T/s' '$wok' run --show -- test -e '$ipc')"
 
-# ---- known, not fixed (R4 finding 2): the clipboard reaches a focused job ----
-# Reported, not a PASS/FAIL: wok can't stop it (work-wok.md, Review).
+# ---- known and accepted (Georg, 2026-11-15): the clipboard reaches a focused job ----
+# Reported, not a PASS/FAIL: a focused job may read (and replace) it.
 secret=wok-clip-$$-$RANDOM
 WAYLAND_DISPLAY=$wd XDG_RUNTIME_DIR=$rt "$wlcopy" "$secret" 2>/dev/null &
 cpid=$!
@@ -107,7 +107,7 @@ sleep 0.5
 got=$(W run --show --timeout 10 -- wl-paste --no-newline 2>/dev/null)
 kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
 if [ "$got" = "$secret" ]; then
-  echo "KNOWN  a --show job read the session's clipboard (R4 finding 2, not fixable in wok)"
+  echo "KNOWN  a --show job read the session's clipboard (accepted: a focused job may)"
 else
   echo "KNOWN  inconclusive here: the stand-in seat has no keyboard, so no window gets focus and no"
   echo "       selection is offered (Wayland sends it to the focused client). On a real seat it is."

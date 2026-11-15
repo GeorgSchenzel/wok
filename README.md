@@ -28,16 +28,21 @@ wok status
   sway hides its privileged protocols from it: no screencopy, background
   clipboard access (data control), virtual keyboard or pointer, layer shell,
   toplevel lists; the daemon checks that through the job's listener and
-  refuses otherwise. **Not hidden:** like any window, while it has keyboard
-  focus the job gets the keys typed into it and the current clipboard and
-  primary selection, and sway focuses new windows by default. The session's
+  refuses otherwise. **Not hidden (accepted):** like any window, while it has
+  keyboard focus the job gets the keys typed into it and can read and replace
+  the clipboard and primary selection (copy a command elsewhere, and a focused
+  job may swap it before you paste); sway focuses new windows by default. The session's
   own socket stays invisible; still no X11, no sound. No `--screenshot` with
   it. Needs sway 1.9+ and `WAYLAND_DISPLAY` (under systemd, read from the user
   manager's environment for each job).
 - Limits: each job runs in a transient systemd user scope (memory 8G, 1024
-  tasks by default; tmpfs counts as memory); its dirs on disk are capped at
-  8 GiB / 200k entries (and it is stopped when the disk is nearly full); a
-  client that stops reading for ~10–20 s loses its job.
+  tasks by default; tmpfs counts as memory; without a scope the job runs
+  uncapped and says so on stderr). Disk: no per-job cap. The job's dirs are
+  on the state dir's disk, and the job is killed when that disk has under
+  1 GiB free (checked each second, so one big `fallocate` can fill it for a
+  moment, until the job's dir is removed). Results over 8 GiB or 200k entries
+  fail on the client with that reason (what arrived before stays). A client
+  that stops reading for ~10–20 s loses its job.
 - The jail's filesystem is an allowlist: /nix/store, /etc, /usr, /bin,
   /lib64, /sys read-only (host mounts inside /etc and /sys masked), the GPU's
   render and NVIDIA nodes, private tmpfs elsewhere. Nothing else of the host.

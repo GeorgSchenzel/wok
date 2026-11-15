@@ -50,8 +50,8 @@ enum Cmd {
         /// to see and play it. Its own lane: neither waits for headless jobs
         /// nor holds them up. Sandboxed there (no screencopy, background
         /// clipboard access or virtual input), but while its window has
-        /// focus it gets the keys typed and the current clipboard; still no
-        /// X11.
+        /// focus it gets the keys typed and can read and replace the
+        /// clipboard and primary selection; still no X11.
         #[arg(long, conflicts_with_all = ["screenshot", "no_display"])]
         show: bool,
         /// Set an env var for the job (repeatable).

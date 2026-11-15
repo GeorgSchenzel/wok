@@ -9,8 +9,9 @@
 # it by its PID. Checks what it can by itself (privileged globals hidden, grim
 # refused, the session's processes and sockets unchanged); the window you
 # answer: vkcube should spin on your sway for 15 s, on the RTX 2080, and close.
-# NOTE (R4): while its window has focus, a --show job gets your keystrokes
-# and the current clipboard. Don't type or copy anything secret meanwhile.
+# NOTE (accepted, 2026-11-15): while its window has focus, a --show job gets
+# your keystrokes and can read and replace the clipboard. Don't type or copy
+# anything secret meanwhile.
 
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)

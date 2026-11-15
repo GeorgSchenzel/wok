@@ -35,8 +35,10 @@
 #     Nothing else of the host exists in the jail: no home, no /persist, no
 #     /backups, no /var, no /nix/var (the nix daemon socket).
 #   - writable on disk: only the job's home with job/ and out/ (all in
-#     <job-root>, removed by the daemon after the job; the daemon caps their
-#     size); tmpfs mounts have sizes
+#     <job-root>, removed by the daemon after the job; the daemon stops a
+#     job when the disk gets nearly full); /tmp, /dev/shm, /run and /home are
+#     sized tmpfs (bwrap's /dev isn't; any tmpfs counts as the job's memory
+#     in its scope)
 #   - no network: own netns, nothing up (AF_VSOCK isn't netns-scoped; there
 #     is no seccomp filter yet)
 #   - own user, pid, ipc, uts and cgroup namespaces; no nested user
@@ -94,12 +96,15 @@ unset WOK_SHOT WOK_DISPLAY
 trap "kill -TERM -1 2>/dev/null" TERM
 # wait for pid $1 even through the TERM trap; its status in rc
 await() { while :; do wait "$1"; rc=$?; kill -0 "$1" 2>/dev/null || return 0; done; }
+# the job in the background, its pid in $!: a non-interactive shell would
+# start it with INT and QUIT ignored, so give them back their defaults
+job() { (trap - INT QUIT; exec "$@") & }
 if [ "$display" = show ]; then
   chmod 700 "$XDG_RUNTIME_DIR" || exit 250
   export WAYLAND_DISPLAY=wayland-0
 fi
 if [ "$display" != 1 ]; then
-  "$@" &
+  job "$@"
   await $!
   exit $rc
 fi
@@ -125,12 +130,12 @@ if [ -z "$wd" ]; then
 fi
 export WAYLAND_DISPLAY=$wd
 if [ -z "$shot" ]; then
-  "$@" &
+  job "$@"
   await $!
 else
   # the app runs in the background: a foreground app is gone at capture
   # time and grim gives an all-black PNG with exit 0 (learnings.md)
-  "$@" &
+  job "$@"
   app=$!
   sleep "$shot" &
   wait $!
@@ -160,14 +165,19 @@ for d in /nix/store /etc /usr /bin /lib64 /sys; do
 done
 # … minus whatever the host mounts inside /etc and /sys (impermanence binds
 # persisted files there: host keys, machine-id, NetworkManager's secrets;
-# /sys has efivars, debugfs, tracefs, bpf…): an empty dir or file instead.
+# /sys has efivars, debugfs, tracefs, bpf…): an empty read-only dir or file
+# instead (a readable empty file: an unreadable machine-id trips up D-Bus
+# and SDL).
+[ -d "$root/.mask-dir" ] || mkdir -m 555 "$root/.mask-dir"
+[ -f "$root/.mask-file" ] || { : > "$root/.mask-file"; chmod 444 "$root/.mask-file"; }
 mask=()
 while read -r _ _ _ _ mp _; do
-  mp=$(printf '%b' "$mp") # mountinfo escapes spaces as \040
+  # mountinfo escapes space, tab, newline and backslash as \ooo
+  mp=${mp//\\040/ }; mp=${mp//\\011/$'\t'}; mp=${mp//\\012/$'\n'}; mp=${mp//\\134/\\}
   case $mp in
     /etc/*|/sys/*)
-      if [ -d "$mp" ]; then mask+=(--tmpfs "$mp")
-      elif [ -e "$mp" ]; then mask+=(--ro-bind /dev/null "$mp")
+      if [ -d "$mp" ]; then mask+=(--ro-bind "$root/.mask-dir" "$mp")
+      elif [ -e "$mp" ]; then mask+=(--ro-bind "$root/.mask-file" "$mp")
       fi ;;
   esac
 done < /proc/self/mountinfo

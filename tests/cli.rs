@@ -27,7 +27,11 @@ impl Daemon {
     /// `desktop`: the daemon's WAYLAND_DISPLAY. Never the real session's:
     /// a test daemon doesn't inherit it.
     fn start_with(desktop: Option<&Path>) -> Daemon {
-        let dir = tempfile::tempdir().unwrap();
+        Daemon::start_in(tempfile::tempdir().unwrap(), desktop)
+    }
+
+    /// In `dir`, which may hold an earlier daemon's state.
+    fn start_in(dir: tempfile::TempDir, desktop: Option<&Path>) -> Daemon {
         let sock = dir.path().join("wok.sock");
         let state = dir.path().join("state");
         let jail = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-jail.sh");
@@ -751,4 +755,47 @@ fn a_job_that_locks_its_dirs_is_still_sent_and_cleaned_up() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn a_deep_locked_tree_is_cleaned_up() {
+    // past PATH_MAX, with a chmod 000 dir and a read-only dir at the bottom
+    let t = tempfile::tempdir().unwrap();
+    let d = Daemon::start();
+    let o = d.run(
+        &[
+            "run",
+            "--no-display",
+            "--",
+            "sh",
+            "-c",
+            "cd ~; for i in $(seq 1100); do mkdir dddd; cd dddd; done; echo x > f; mkdir l; chmod 000 l; chmod 500 .",
+        ],
+        t.path(),
+    );
+    assert!(o.status.success(), "{}", s(&o.stderr));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while d.job_dirs() != 0 {
+        assert!(Instant::now() < deadline, "the deep job dir stays");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_daemon_starts_over_leftover_locked_job_dirs() {
+    // an earlier daemon died mid-job, leaving read-only and chmod 000 dirs
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let jobs = dir.path().join("state/jobs");
+    for (name, mode) in [("1-ro/job/cache", 0o555), ("2-locked/out/x", 0o000)] {
+        let p = jobs.join(name);
+        fs::create_dir_all(&p).unwrap();
+        fs::write(p.join("f"), "x").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let d = Daemon::start_in(dir, None);
+    assert_eq!(d.job_dirs(), 0, "the leftovers stay");
+    let t = tempfile::tempdir().unwrap();
+    let o = d.run(&["run", "--no-display", "--", "true"], t.path());
+    assert!(o.status.success(), "{}", s(&o.stderr));
 }
