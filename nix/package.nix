@@ -16,6 +16,9 @@ rustPlatform.buildRustPackage {
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;
+  # Tests run with `just test`. Not here: bento's builder runs them as root on
+  # an overlay, where the chmod-000 and 1100-deep cleanup tests fail (C2).
+  doCheck = false;
   meta = {
     description = "GPU jobs from any box, jailed on the GPU machine";
     mainProgram = "wok";
