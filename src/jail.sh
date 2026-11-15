@@ -170,16 +170,22 @@ done
 # and SDL).
 [ -d "$root/.mask-dir" ] || mkdir -m 555 "$root/.mask-dir"
 [ -f "$root/.mask-file" ] || { : > "$root/.mask-file"; chmod 444 "$root/.mask-file"; }
-mask=()
+# A mount under one already masked is skipped: the mask hides it anyway, and
+# bwrap can't make its mount point in the read-only mask (tracefs under
+# debugfs after perf/bpftrace; a persisted dir with persisted files in it).
+mask=() masked=()
 while read -r _ _ _ _ mp _; do
   # mountinfo escapes space, tab, newline and backslash as \ooo
   mp=${mp//\\040/ }; mp=${mp//\\011/$'\t'}; mp=${mp//\\012/$'\n'}; mp=${mp//\\134/\\}
-  case $mp in
-    /etc/*|/sys/*)
-      if [ -d "$mp" ]; then mask+=(--ro-bind "$root/.mask-dir" "$mp")
-      elif [ -e "$mp" ]; then mask+=(--ro-bind "$root/.mask-file" "$mp")
-      fi ;;
-  esac
+  case $mp in /etc/*|/sys/*) ;; *) continue ;; esac
+  for m in "${masked[@]}"; do
+    case $mp in "$m"|"$m"/*) continue 2 ;; esac
+  done
+  if [ -d "$mp" ]; then mask+=(--ro-bind "$root/.mask-dir" "$mp")
+  elif [ -e "$mp" ]; then mask+=(--ro-bind "$root/.mask-file" "$mp")
+  else continue
+  fi
+  masked+=("$mp")
 done < /proc/self/mountinfo
 # GPU: render nodes and NVIDIA's nodes only
 gpu=()

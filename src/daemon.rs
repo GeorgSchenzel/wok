@@ -743,9 +743,13 @@ fn run_job(
         }
 
         let now = Instant::now();
+        if exited_at.is_none() && child.try_wait()?.is_some() {
+            exited_at = Some(now);
+        }
         // the disk: a KILL at once (a TERM's grace is more writes), and
-        // checked through the grace of any other stop too
-        if stopped.is_none() && now >= next_disk_check {
+        // checked through the grace of any other stop too; not once the jail
+        // has exited (a job that ended on its own keeps its exit status)
+        if stopped.is_none() && exited_at.is_none() && now >= next_disk_check {
             next_disk_check = now + DISK_CHECK;
             if free_bytes(root).is_some_and(|f| f < s.min_free) {
                 stopped = Some(format!(
@@ -763,9 +767,6 @@ fn run_job(
         }
         if killed_at.is_some_and(|t| now >= t + KILL_GRACE) {
             signal(libc::SIGKILL);
-        }
-        if exited_at.is_none() && child.try_wait()?.is_some() {
-            exited_at = Some(now);
         }
         // done when both pipes are closed, or the jail exited and something
         // it left behind still holds a pipe (it can't outlive the pid ns long)

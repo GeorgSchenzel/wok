@@ -103,6 +103,25 @@ fi
 # a masked file reads as empty (an unreadable machine-id trips up D-Bus, SDL)
 [ -e /etc/machine-id ] && check "/etc/machine-id is readable (empty, if masked)" J cat /etc/machine-id
 check "masks are read-only" notJ sh -c 'for m in /sys/firmware/efi/efivars /sys/kernel/debug; do [ -d "$m" ] && : > "$m/x" && exit 0; done; exit 1'
+# nested host mounts under /etc and /sys (tracefs under debugfs after perf or
+# bpftrace; a persisted dir holding persisted files), simulated without root
+# in a user and mount namespace: the jail still starts, the parent's mask
+# hides the children
+etcd=$(for d in /etc/*/; do [ -L "${d%/}" ] || { echo "${d%/}"; break; }; done)
+if [ -n "$etcd" ] && unshare -rm true 2>/dev/null; then
+  nested=$(unshare -rm --propagation private env SECRETCANARY=$CANARY WOK_DISPLAY=0 bash -c '
+    d=$1 jail=$2 root=$3
+    mount -t tmpfs t "$d" && mkdir "$d/inner" && : > "$d/key" &&
+      mount -t tmpfs t "$d/inner" && : > "$d/inner/x" && mount --bind /etc/hostname "$d/key" || exit 90
+    if mount -t tmpfs t /sys/kernel/debug 2>/dev/null; then
+      mkdir /sys/kernel/debug/tracing && mount -t tmpfs t /sys/kernel/debug/tracing || exit 91
+    fi
+    "$jail" "$root" -- sh -c "ls -A \"\$1\" /sys/kernel/debug 2>/dev/null | grep -v -e : -e ^\$; echo ran" _ "$d" </dev/null
+  ' _ "$etcd" "$JAIL" "$T/root" 2>&1)
+  check "nested host mounts under /etc and /sys: the jail starts, all masked [${nested//$'\n'/ }]" [ "$nested" = ran ]
+else
+  echo "SKIP  nested host mounts (no unprivileged user namespaces)"
+fi
 # a canary written on the host, outside the allowlist: nowhere in the jail's
 # writable or host-backed trees (the store, /proc and /sys aside)
 canary=wok-fs-canary-$$-$RANDOM
